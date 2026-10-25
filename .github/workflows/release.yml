@@ -1,0 +1,105 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.88.0
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --all-targets --locked
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            binary: wechat-oa
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: wechat-oa
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: wechat-oa
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: wechat-oa.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --target ${{ matrix.target }}
+          rustup default 1.88.0
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wechat-oa-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: wechat-oa-*
+          path: dist
+      - name: Verify tag and crate version
+        run: |
+          crate_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test "${GITHUB_REF_NAME}" = "v${crate_version}"
+      - name: Package release archives
+        run: |
+          mkdir -p release-assets staging
+
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+            mkdir -p "staging/${target}"
+            install -m 755 "dist/wechat-oa-${target}/wechat-oa" "staging/${target}/wechat-oa"
+            cp README.md LICENSE "staging/${target}/"
+            tar -czf "release-assets/wechat-oa-${target}.tar.gz" -C "staging/${target}" .
+          done
+
+          mkdir -p staging/x86_64-pc-windows-msvc
+          cp dist/wechat-oa-x86_64-pc-windows-msvc/wechat-oa.exe staging/x86_64-pc-windows-msvc/
+          cp README.md LICENSE staging/x86_64-pc-windows-msvc/
+          (cd staging/x86_64-pc-windows-msvc && zip -q "../../release-assets/wechat-oa-x86_64-pc-windows-msvc.zip" wechat-oa.exe README.md LICENSE)
+
+          (cd release-assets && sha256sum *.tar.gz *.zip > SHA256SUMS)
+          tar -tzf release-assets/wechat-oa-aarch64-apple-darwin.tar.gz >/dev/null
+          tar -tzf release-assets/wechat-oa-x86_64-apple-darwin.tar.gz >/dev/null
+          tar -tzf release-assets/wechat-oa-x86_64-unknown-linux-gnu.tar.gz >/dev/null
+          unzip -t release-assets/wechat-oa-x86_64-pc-windows-msvc.zip >/dev/null
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

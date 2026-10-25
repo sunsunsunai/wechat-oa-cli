@@ -1,0 +1,23 @@
+[package]
+name = "wechat-oa-cli"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A machine-friendly CLI and Rust client for WeChat Official Accounts, designed for AI agents and automation."
+license = "MIT"
+repository = "https://github.com/sunsunsunai/wechat-oa-cli"
+
+[[bin]]
+name = "wechat-oa"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+directories = "6.0.0"
+lol_html = "3.0.2"
+reqwest = { version = "0.13.5", features = ["multipart"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["fs", "io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
