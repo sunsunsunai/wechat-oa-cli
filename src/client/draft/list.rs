@@ -100,4 +100,33 @@ mod tests {
 
         assert!(response.item[0].content.is_none());
     }
+
+    #[test]
+    fn deserializes_article_metadata_when_only_bodies_are_omitted() {
+        let response: ListDraftResponse = serde_json::from_value(serde_json::json!({
+            "total_count": 1,
+            "item_count": 1,
+            "item": [{
+                "media_id": "draft-media-id",
+                "content": {
+                    "news_item": [{
+                        "article_type": "news",
+                        "title": "Metadata only",
+                        "thumb_media_id": "thumb-id",
+                        "need_open_comment": 0,
+                        "only_fans_can_comment": 0,
+                        "url": "https://mp.weixin.qq.com/draft/example"
+                    }]
+                },
+                "update_time": 1_700_000_000
+            }]
+        }))
+        .unwrap();
+
+        assert!(
+            response.item[0].content.as_ref().unwrap().news_item[0]
+                .content
+                .is_empty()
+        );
+    }
 }

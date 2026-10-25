@@ -25,6 +25,8 @@ pub struct DraftArticle {
     pub title: String,
     pub author: Option<String>,
     pub digest: Option<String>,
+    /// Empty when the batch-get API omits the body for `no_content: 1`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     pub content_source_url: Option<String>,
     pub thumb_media_id: String,
@@ -157,5 +159,30 @@ mod tests {
                 .product_key,
             "product-1"
         );
+    }
+
+    #[test]
+    fn accepts_article_metadata_when_batch_get_omits_bodies() {
+        let item: DraftItem = serde_json::from_value(serde_json::json!({
+            "media_id": "draft-media-id",
+            "content": {
+                "news_item": [{
+                    "article_type": "news",
+                    "title": "Article without body",
+                    "thumb_media_id": "thumb-id",
+                    "thumb_url": "https://mmbiz.example/thumb.jpg",
+                    "need_open_comment": 0,
+                    "only_fans_can_comment": 0,
+                    "cover_info": { "crop_percent_list": [] },
+                    "url": "https://mp.weixin.qq.com/draft/example"
+                }]
+            },
+            "update_time": 1_700_000_000
+        }))
+        .unwrap();
+
+        let article = &item.content.unwrap().news_item[0];
+        assert!(article.content.is_empty());
+        assert_eq!(article.title, "Article without body");
     }
 }
