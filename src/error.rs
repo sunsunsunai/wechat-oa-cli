@@ -14,7 +14,7 @@ pub struct WechatApiError {
 
 impl WechatApiError {
     pub fn is_token_invalid(&self) -> bool {
-        matches!(self.code, 40014 | 42001)
+        matches!(self.code, 40001 | 40014 | 42001)
     }
 
     pub fn is_permission_denied(&self) -> bool {
@@ -144,4 +144,21 @@ pub enum ConfigError {
 
     #[error("environment variable cannot be empty: {name}")]
     EmptyEnvironmentVariable { name: &'static str },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_all_token_rejection_codes() {
+        for code in [40001, 40014, 42001] {
+            let error = WechatApiError {
+                code,
+                message: "rejected".to_owned(),
+                request_id: None,
+            };
+            assert!(error.is_token_invalid(), "{code}");
+        }
+    }
 }

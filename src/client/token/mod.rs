@@ -15,6 +15,8 @@ use crate::{
 const TOKEN_ENDPOINT: &str = "https://api.weixin.qq.com/cgi-bin/stable_token";
 const DEFAULT_REFRESH_BEFORE: Duration = Duration::from_secs(5 * 60);
 const MAX_TOKEN_RESPONSE_LENGTH: usize = 64 * 1024;
+const MAX_TOKEN_ATTEMPTS: u32 = 3;
+const INITIAL_TOKEN_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Obtains and caches a WeChat Official Account access token.
 ///
@@ -136,6 +138,27 @@ impl TokenManager {
     }
 
     async fn fetch_token(
+        &self,
+        http: &reqwest::Client,
+        force_refresh: bool,
+    ) -> Result<CachedToken, WechatError> {
+        let mut attempt = 1;
+        loop {
+            let result = self.fetch_token_once(http, force_refresh).await;
+            match result {
+                Err(ref error)
+                    if !force_refresh && error.is_retryable() && attempt < MAX_TOKEN_ATTEMPTS =>
+                {
+                    let delay = INITIAL_TOKEN_RETRY_DELAY * 2_u32.pow(attempt - 1);
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn fetch_token_once(
         &self,
         http: &reqwest::Client,
         force_refresh: bool,

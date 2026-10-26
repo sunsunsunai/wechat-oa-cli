@@ -38,7 +38,7 @@ trait DraftBackend {
 
     async fn add_draft(&self, request: &AddDraftRequest) -> Result<AddDraftResponse, WechatError>;
 
-    async fn draft_exists(&self, media_id: &str) -> Result<bool, WechatError>;
+    async fn draft_fingerprint(&self, media_id: &str) -> Result<Option<String>, WechatError>;
 }
 
 impl DraftBackend for WechatOAClient {
@@ -58,10 +58,10 @@ impl DraftBackend for WechatOAClient {
         self.draft().add(request).await
     }
 
-    async fn draft_exists(&self, media_id: &str) -> Result<bool, WechatError> {
+    async fn draft_fingerprint(&self, media_id: &str) -> Result<Option<String>, WechatError> {
         match self.draft().get(media_id).await {
-            Ok(_) => Ok(true),
-            Err(WechatError::Api(error)) if error.code == 40007 => Ok(false),
+            Ok(content) => Ok(Some(remote_draft_fingerprint(&content)?)),
+            Err(WechatError::Api(error)) if error.code == 40007 => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -138,11 +138,14 @@ async fn push_with_backend<B: DraftBackend>(
     let fingerprint = bytes_sha256(&request_bytes);
 
     if !force
-        && let Some(media_id) = state
-            .completed_media_id(&fingerprint)
-            .map(ToOwned::to_owned)
+        && let Some((media_id, stored_remote_fingerprint)) = state
+            .completed_push(&fingerprint)
+            .map(|(media_id, remote)| (media_id.to_owned(), remote.map(ToOwned::to_owned)))
     {
-        if backend.draft_exists(&media_id).await? {
+        let current_remote_fingerprint = backend.draft_fingerprint(&media_id).await?;
+        if stored_remote_fingerprint.is_some()
+            && current_remote_fingerprint == stored_remote_fingerprint
+        {
             return Ok(result_json(
                 &media_id,
                 draft.title(),
@@ -158,7 +161,24 @@ async fn push_with_backend<B: DraftBackend>(
     state.save().await?;
     match backend.add_draft(&request).await {
         Ok(response) => {
-            state.complete_push(fingerprint, response.media_id.clone());
+            let (remote_fingerprint, verification_warning) =
+                match backend.draft_fingerprint(&response.media_id).await {
+                    Ok(Some(remote_fingerprint)) => (Some(remote_fingerprint), None),
+                    Ok(None) => (
+                        None,
+                        Some(
+                            "draft was created remotely, but it was not immediately readable; the next push will not reuse it"
+                                .to_owned(),
+                        ),
+                    ),
+                    Err(error) => (
+                        None,
+                        Some(format!(
+                            "draft was created remotely, but its content fingerprint could not be recorded: {error}; the next push will not reuse it"
+                        )),
+                    ),
+                };
+            state.complete_push(fingerprint, response.media_id.clone(), remote_fingerprint);
             let mut result = result_json(
                 &response.media_id,
                 draft.title(),
@@ -166,11 +186,17 @@ async fn push_with_backend<B: DraftBackend>(
                 counts.reused,
                 false,
             );
+            if let Some(warning) = verification_warning {
+                result["warning"] = Value::String(warning);
+            }
             if let Err(error) = state.save().await {
                 result["state_saved"] = Value::Bool(false);
-                result["warning"] = Value::String(format!(
-                    "draft was created remotely, but local state could not be saved: {error}"
-                ));
+                append_warning(
+                    &mut result,
+                    format!(
+                        "draft was created remotely, but local state could not be saved: {error}"
+                    ),
+                );
             }
             Ok(result)
         }
@@ -180,6 +206,31 @@ async fn push_with_backend<B: DraftBackend>(
             Err(source.into())
         }
         Err(source) => Err(CliError::AmbiguousDraftPush { source }),
+    }
+}
+
+fn remote_draft_fingerprint(
+    content: &crate::client::draft::DraftContent,
+) -> Result<String, WechatError> {
+    let mut value = serde_json::to_value(content).map_err(WechatError::Encode)?;
+    if let Some(articles) = value.get_mut("news_item").and_then(Value::as_array_mut) {
+        for article in articles {
+            if let Some(article) = article.as_object_mut() {
+                article.remove("url");
+            }
+        }
+    }
+    let bytes = serde_json::to_vec(&value).map_err(WechatError::Encode)?;
+    Ok(bytes_sha256(&bytes))
+}
+
+fn append_warning(result: &mut Value, warning: String) {
+    match result.get_mut("warning") {
+        Some(Value::String(existing)) => {
+            existing.push_str("; ");
+            existing.push_str(&warning);
+        }
+        _ => result["warning"] = Value::String(warning),
     }
 }
 
@@ -344,7 +395,7 @@ mod tests {
         permanent_uploads: Mutex<Vec<String>>,
         article_uploads: Mutex<Vec<String>>,
         draft_requests: Mutex<Vec<Value>>,
-        draft_exists: Mutex<bool>,
+        remote_fingerprint: Mutex<Option<String>>,
     }
 
     impl FakeBackend {
@@ -354,7 +405,7 @@ mod tests {
                 permanent_uploads: Mutex::new(Vec::new()),
                 article_uploads: Mutex::new(Vec::new()),
                 draft_requests: Mutex::new(Vec::new()),
-                draft_exists: Mutex::new(true),
+                remote_fingerprint: Mutex::new(Some("remote-fingerprint".to_owned())),
             }
         }
     }
@@ -394,8 +445,8 @@ mod tests {
             })
         }
 
-        async fn draft_exists(&self, _media_id: &str) -> Result<bool, WechatError> {
-            Ok(*self.draft_exists.lock().unwrap())
+        async fn draft_fingerprint(&self, _media_id: &str) -> Result<Option<String>, WechatError> {
+            Ok(self.remote_fingerprint.lock().unwrap().clone())
         }
     }
 
@@ -520,13 +571,31 @@ mod tests {
         push_with_backend(&backend, &root, false, false, None)
             .await
             .unwrap();
-        *backend.draft_exists.lock().unwrap() = false;
+        *backend.remote_fingerprint.lock().unwrap() = None;
         let recreated = push_with_backend(&backend, &root, false, false, None)
             .await
             .unwrap();
 
         assert_eq!(recreated["reused_draft"], false);
         assert_eq!(recreated["assets"]["reused"], 2);
+        assert_eq!(backend.draft_requests.lock().unwrap().len(), 2);
+        clean_test_state(&root, backend.account_id());
+    }
+
+    #[tokio::test]
+    async fn modified_remote_draft_is_recreated() {
+        let root = temporary_picture_draft("modified-remote");
+        let backend = FakeBackend::new(format!("modified-account-{}", std::process::id()));
+
+        push_with_backend(&backend, &root, false, false, None)
+            .await
+            .unwrap();
+        *backend.remote_fingerprint.lock().unwrap() = Some("modified".to_owned());
+        let recreated = push_with_backend(&backend, &root, false, false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(recreated["reused_draft"], false);
         assert_eq!(backend.draft_requests.lock().unwrap().len(), 2);
         clean_test_state(&root, backend.account_id());
     }

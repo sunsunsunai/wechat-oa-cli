@@ -41,7 +41,7 @@ Windows 解压 ZIP 后，将 `wechat-oa.exe` 所在目录添加到 PATH。发布
 chmod 600 /path/to/config.json
 ```
 
-也可以使用 `WECHAT_OA_APP_ID`、`WECHAT_OA_APP_SECRET` 环境变量，或通过全局 `--config` 参数指定配置文件。
+也可以使用 `WECHAT_OA_APP_ID`、`WECHAT_OA_APP_SECRET` 环境变量，或通过全局 `--config` 参数指定配置文件。Windows 当前无法可靠验证配置文件 ACL，因此必须使用环境变量，避免从可能被其他用户读取的文件加载 `AppSecret`。
 
 ## 认证与权限
 
@@ -95,7 +95,7 @@ wechat-oa draft validate ./my-draft
 wechat-oa draft push ./my-draft
 ```
 
-`draft push` 会维护按公众号隔离的本地状态，用于复用已经上传且内容未变化的图片，并避免网络结果不明确时自动重复创建草稿。复用草稿前会向微信确认它仍然存在；如果素材在微信后台被删除，或确实需要重新上传所有图片并创建新草稿，可使用 `--force`。遇到历史无账号缓存时，确认属于当前账号后使用 `--legacy-state adopt`，或使用 `--legacy-state discard` 删除旧缓存并重新上传。
+`draft push` 会维护按公众号隔离的本地状态，用于复用已经上传且内容未变化的图片，并避免网络结果不明确时自动重复创建草稿。复用草稿前会向微信确认它仍然存在且内容指纹未变化；如果素材在微信后台被删除，或确实需要重新上传所有图片并创建新草稿，可使用 `--force`。遇到历史无账号缓存时，确认属于当前账号后使用 `--legacy-state adopt`，或使用 `--legacy-state discard` 删除旧缓存并重新上传。
 
 ### 本地草稿格式
 

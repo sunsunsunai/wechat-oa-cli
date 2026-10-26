@@ -111,9 +111,18 @@ fn ensure_private_config(path: &Path, metadata: &fs::Metadata) -> Result<(), Wec
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn ensure_private_config(_path: &Path, _metadata: &fs::Metadata) -> Result<(), WechatError> {
-    Ok(())
+    Err(WechatError::InvalidConfig(
+        "credential JSON files are disabled on Windows because their ACL privacy cannot be verified; use WECHAT_OA_APP_ID and WECHAT_OA_APP_SECRET",
+    ))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn ensure_private_config(_path: &Path, _metadata: &fs::Metadata) -> Result<(), WechatError> {
+    Err(WechatError::InvalidConfig(
+        "credential JSON files are unsupported on this platform; use WECHAT_OA_APP_ID and WECHAT_OA_APP_SECRET",
+    ))
 }
 
 impl Default for TokenManagerBuilder {

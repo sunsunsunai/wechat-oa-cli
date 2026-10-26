@@ -36,7 +36,7 @@ pub(crate) struct DraftState {
     #[serde(default)]
     pending_push: Option<String>,
     #[serde(default)]
-    completed_pushes: BTreeMap<String, String>,
+    completed_pushes: BTreeMap<String, CompletedPushRecord>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -60,6 +60,34 @@ struct PermanentImageRecord {
 struct ArticleImageRecord {
     sha256: String,
     url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum CompletedPushRecord {
+    Current {
+        media_id: String,
+        #[serde(default)]
+        remote_fingerprint: Option<String>,
+    },
+    Legacy(String),
+}
+
+impl CompletedPushRecord {
+    fn media_id(&self) -> &str {
+        match self {
+            Self::Current { media_id, .. } | Self::Legacy(media_id) => media_id,
+        }
+    }
+
+    fn remote_fingerprint(&self) -> Option<&str> {
+        match self {
+            Self::Current {
+                remote_fingerprint, ..
+            } => remote_fingerprint.as_deref(),
+            Self::Legacy(_) => None,
+        }
+    }
 }
 
 impl DraftState {
@@ -250,8 +278,10 @@ impl DraftState {
             Some(ArticleImageRecord { sha256, url });
     }
 
-    pub(crate) fn completed_media_id(&self, fingerprint: &str) -> Option<&str> {
-        self.completed_pushes.get(fingerprint).map(String::as_str)
+    pub(crate) fn completed_push(&self, fingerprint: &str) -> Option<(&str, Option<&str>)> {
+        self.completed_pushes
+            .get(fingerprint)
+            .map(|record| (record.media_id(), record.remote_fingerprint()))
     }
 
     pub(crate) fn remove_completed(&mut self, fingerprint: &str) {
@@ -285,9 +315,20 @@ impl DraftState {
         self.pending_push = None;
     }
 
-    pub(crate) fn complete_push(&mut self, fingerprint: String, media_id: String) {
+    pub(crate) fn complete_push(
+        &mut self,
+        fingerprint: String,
+        media_id: String,
+        remote_fingerprint: Option<String>,
+    ) {
         self.pending_push = None;
-        self.completed_pushes.insert(fingerprint, media_id);
+        self.completed_pushes.insert(
+            fingerprint,
+            CompletedPushRecord::Current {
+                media_id,
+                remote_fingerprint,
+            },
+        );
     }
 
     pub(crate) async fn save(&self) -> Result<(), CliError> {
@@ -716,6 +757,22 @@ mod tests {
     }
 
     #[test]
+    fn reads_legacy_completed_push_without_treating_it_as_verified() {
+        let state: DraftState = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "assets": {},
+            "pending_push": null,
+            "completed_pushes": { "fingerprint": "media-id" }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            state.completed_push("fingerprint"),
+            Some(("media-id", None))
+        );
+    }
+
+    #[test]
     fn sha256_is_stable() {
         assert_eq!(
             bytes_sha256(b"hello"),
@@ -732,11 +789,18 @@ mod tests {
         let directory = state.path.parent().unwrap().to_path_buf();
         state.begin_push("fingerprint".to_owned());
         state.save().await.unwrap();
-        state.complete_push("fingerprint".to_owned(), "media-id".to_owned());
+        state.complete_push(
+            "fingerprint".to_owned(),
+            "media-id".to_owned(),
+            Some("remote-fingerprint".to_owned()),
+        );
         state.save().await.unwrap();
 
         let loaded = DraftState::load_path(state.path.clone()).await.unwrap();
-        assert_eq!(loaded.completed_media_id("fingerprint"), Some("media-id"));
+        assert_eq!(
+            loaded.completed_push("fingerprint"),
+            Some(("media-id", Some("remote-fingerprint")))
+        );
 
         #[cfg(unix)]
         {

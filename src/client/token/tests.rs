@@ -11,6 +11,10 @@ use tokio::{
 use super::*;
 
 async fn test_server(body: &'static str) -> (String, Arc<AtomicUsize>) {
+    test_server_sequence(vec![body]).await
+}
+
+async fn test_server_sequence(bodies: Vec<&'static str>) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let request_count = Arc::new(AtomicUsize::new(0));
@@ -26,7 +30,10 @@ async fn test_server(body: &'static str) -> (String, Arc<AtomicUsize>) {
             let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
             let request = String::from_utf8_lossy(&buffer[..bytes_read]);
             let response_body = if request.starts_with("POST /cgi-bin/stable_token ") {
-                body
+                bodies
+                    .get(count.load(Ordering::SeqCst).saturating_sub(1))
+                    .copied()
+                    .unwrap_or_else(|| *bodies.last().unwrap())
             } else {
                 r#"{"errcode":40002,"errmsg":"expected stable token POST"}"#
             };
@@ -152,4 +159,55 @@ async fn concurrent_requests_share_one_refresh() {
         assert_eq!(call.await.unwrap(), "shared-token");
     }
     assert_eq!(request_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn retries_retryable_errors_in_normal_mode() {
+    let (endpoint, request_count) = test_server_sequence(vec![
+        r#"{"errcode":-1,"errmsg":"system busy"}"#,
+        r#"{"errcode":-1,"errmsg":"system busy"}"#,
+        r#"{"access_token":"recovered-token","expires_in":7200}"#,
+    ])
+    .await;
+    let manager = TokenManager::with_options(
+        "app-id".to_owned(),
+        "secret".to_owned(),
+        endpoint,
+        Duration::from_secs(300),
+    );
+
+    assert_eq!(
+        manager.access_token(&reqwest::Client::new()).await.unwrap(),
+        "recovered-token"
+    );
+    assert_eq!(request_count.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn does_not_retry_force_refresh_after_an_ambiguous_failure() {
+    let (endpoint, request_count) = test_server_sequence(vec![
+        r#"{"access_token":"token-1","expires_in":7200}"#,
+        r#"{"errcode":-1,"errmsg":"system busy"}"#,
+        r#"{"access_token":"token-2","expires_in":7200}"#,
+    ])
+    .await;
+    let manager = TokenManager::with_options(
+        "app-id".to_owned(),
+        "secret".to_owned(),
+        endpoint,
+        Duration::from_secs(300),
+    );
+    let http = reqwest::Client::new();
+    manager.access_token(&http).await.unwrap();
+
+    let error = manager
+        .refresh_rejected(&http, "token-1")
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        WechatError::Api(WechatApiError { code: -1, .. })
+    ));
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
 }
