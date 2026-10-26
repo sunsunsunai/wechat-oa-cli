@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
-use super::html::local_image_sources;
+use super::html::{local_image_sources, validate_plain_text};
 use crate::{
     cli::CliError,
     client::{
@@ -140,7 +140,7 @@ impl ResolvedDraft {
                 validate_schema_version(schema_version)?;
                 validate_comment_options(need_open_comment, only_fans_can_comment)?;
                 let content = read_content(&root, &content_file).await?;
-                validate_picture_content(&content)?;
+                validate_plain_text(&content)?;
                 let mut image_paths = Vec::with_capacity(image_files.len());
                 for image_file in image_files {
                     image_paths.push(resolve_file_inside(&root, &image_file).await?);
@@ -411,46 +411,6 @@ fn validate_schema_version(schema_version: u32) -> Result<(), CliError> {
     Ok(())
 }
 
-fn validate_picture_content(content: &str) -> Result<(), CliError> {
-    if contains_html_tag(content) {
-        return Err(CliError::InvalidDraft(
-            "newspic content must be plain text; HTML tags are not supported by the high-level workflow"
-                .to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn contains_html_tag(content: &str) -> bool {
-    let bytes = content.as_bytes();
-    let mut offset = 0;
-    while let Some(relative) = content[offset..].find('<') {
-        let opening = offset + relative;
-        let Some(relative_closing) = content[opening + 1..].find('>') else {
-            return false;
-        };
-        let closing = opening + 1 + relative_closing;
-        let mut index = opening + 1;
-        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
-            index += 1;
-        }
-        if bytes.get(index) == Some(&b'/') {
-            index += 1;
-            while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
-                index += 1;
-            }
-        }
-        if bytes
-            .get(index)
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'!' | b'?'))
-        {
-            return true;
-        }
-        offset = closing + 1;
-    }
-    false
-}
-
 async fn read_content(root: &Path, relative: &Path) -> Result<String, CliError> {
     let content_path = resolve_file_inside(root, relative).await?;
     let content_bytes = read_limited(&content_path, MAX_CONTENT_BYTES).await?;
@@ -562,12 +522,5 @@ mod tests {
                 { "image_media_id": "media-2" }
             ])
         );
-    }
-
-    #[test]
-    fn picture_content_accepts_plain_text_and_rejects_html() {
-        assert!(validate_picture_content("价格 < 3 元，今天 > 昨天").is_ok());
-        assert!(validate_picture_content("<p>HTML caption</p>").is_err());
-        assert!(validate_picture_content("text < img src=x>").is_err());
     }
 }

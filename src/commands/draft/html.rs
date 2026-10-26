@@ -1,11 +1,11 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap},
     path::Path,
     rc::Rc,
 };
 
-use lol_html::{RewriteStrSettings, element, rewrite_str, text};
+use lol_html::{RewriteStrSettings, doc_comments, element, rewrite_str, text};
 
 use crate::cli::CliError;
 
@@ -50,20 +50,17 @@ pub(crate) fn local_image_sources(html: &str) -> Result<Vec<String>, CliError> {
     .map_err(|error| CliError::Html(error.to_string()))?;
 
     let style_block_sources = css_urls(&style_text.borrow());
-    for source in style_block_sources {
-        if matches!(classify_source(&source)?, ImageSource::Local(_)) {
-            return Err(CliError::InvalidDraft(
-                "local CSS url() references inside <style> are not supported; use an inline style attribute"
-                    .to_owned(),
-            ));
-        }
+    if let Some(source) = style_block_sources.first() {
+        classify_source(source)?;
+        return Err(CliError::InvalidDraft(
+            "local CSS url() references inside <style> are not supported; use an inline style attribute"
+                .to_owned(),
+        ));
     }
 
     let mut local = BTreeSet::new();
     for source in sources.borrow().iter() {
-        if let ImageSource::Local(source) = classify_source(source)? {
-            local.insert(source);
-        }
+        local.insert(classify_source(source)?);
     }
     Ok(local.into_iter().collect())
 }
@@ -112,6 +109,33 @@ pub(crate) fn rewrite_local_images(
             })),
     )
     .map_err(|error| CliError::Html(error.to_string()))
+}
+
+pub(crate) fn validate_plain_text(content: &str) -> Result<(), CliError> {
+    let contains_markup = Rc::new(Cell::new(false));
+    let element_flag = Rc::clone(&contains_markup);
+    let comment_flag = Rc::clone(&contains_markup);
+    rewrite_str(
+        content,
+        RewriteStrSettings::new()
+            .append_element_content_handler(element!("*", move |_| {
+                element_flag.set(true);
+                Ok(())
+            }))
+            .append_document_content_handler(doc_comments!(move |_| {
+                comment_flag.set(true);
+                Ok(())
+            })),
+    )
+    .map_err(|error| CliError::Html(error.to_string()))?;
+
+    if contains_markup.get() {
+        return Err(CliError::InvalidDraft(
+            "newspic content must be plain text; HTML tags are not supported by the high-level workflow"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn srcset_urls(srcset: &str) -> Vec<String> {
@@ -200,12 +224,7 @@ fn rewrite_css_urls(css: &str, replacements: &HashMap<String, String>) -> String
     rewritten
 }
 
-enum ImageSource {
-    Remote,
-    Local(String),
-}
-
-fn classify_source(source: &str) -> Result<ImageSource, CliError> {
+fn classify_source(source: &str) -> Result<String, CliError> {
     let source = source.trim();
     if source.is_empty() {
         return Err(CliError::InvalidDraft(
@@ -214,7 +233,9 @@ fn classify_source(source: &str) -> Result<ImageSource, CliError> {
     }
     let lower = source.to_ascii_lowercase();
     if lower.starts_with("https://") || lower.starts_with("http://") || source.starts_with("//") {
-        return Ok(ImageSource::Remote);
+        return Err(CliError::InvalidDraft(format!(
+            "remote image URL `{source}` is not supported; save the image inside the draft directory so it can be uploaded to WeChat"
+        )));
     }
     if lower.starts_with("data:") {
         return Err(CliError::InvalidDraft(
@@ -240,7 +261,7 @@ fn classify_source(source: &str) -> Result<ImageSource, CliError> {
             "unsupported image URL scheme in `{source}`"
         )));
     }
-    Ok(ImageSource::Local(source.to_owned()))
+    Ok(source.to_owned())
 }
 
 #[cfg(test)]
@@ -251,7 +272,6 @@ mod tests {
     fn extracts_only_local_images_and_deduplicates_them() {
         let html = r#"
             <p><img src="assets/a.png"></p>
-            <img src="https://example.com/remote.png">
             <img src="assets/a.png">
             <img src="./assets/b.jpg">
         "#;
@@ -320,5 +340,32 @@ mod tests {
         )
         .unwrap();
         assert!(rewritten.contains("background: url('https://cdn/a.png')"));
+    }
+
+    #[test]
+    fn rejects_remote_images_in_every_supported_location() {
+        for html in [
+            r#"<img src="https://example.com/a.png">"#,
+            r#"<source srcset="//example.com/a.png 1x">"#,
+            r#"<p style="background:url('http://example.com/a.png')"></p>"#,
+            r#"<style>.hero { background:url(https://example.com/a.png) }</style>"#,
+        ] {
+            let error = local_image_sources(html).unwrap_err();
+            assert!(error.to_string().contains("remote image URL"));
+        }
+    }
+
+    #[test]
+    fn plain_text_validation_distinguishes_comparisons_from_markup() {
+        for text in ["价格 < 3 元，今天 > 昨天", "x < y > z", "1 < 2"] {
+            assert!(validate_plain_text(text).is_ok(), "{text}");
+        }
+        for markup in [
+            "<p>caption</p>",
+            "text <strong>bold</strong>",
+            "<!-- note -->",
+        ] {
+            assert!(validate_plain_text(markup).is_err(), "{markup}");
+        }
     }
 }
