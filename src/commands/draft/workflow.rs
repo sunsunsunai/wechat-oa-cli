@@ -1,9 +1,9 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, path::PathBuf};
 
 use serde_json::{Value, json};
 
 use super::{
-    document::ResolvedDraft,
+    document::{ResolvedArticle, ResolvedDraft},
     html::{local_image_sources, rewrite_local_images},
     state::{DraftState, LegacyStatePolicy, bytes_sha256, file_sha256},
 };
@@ -24,18 +24,7 @@ pub async fn push(
     legacy_state: Option<LegacyStateAction>,
 ) -> Result<Value, CliError> {
     let draft = ResolvedDraft::load(path).await?;
-    validate_permanent_image(&draft.cover_path).await?;
-
-    // Resolve and validate every local dependency before uploading anything.
-    // This avoids leaving permanent orphan assets when a later path is bad.
-    let mut local_images = Vec::new();
-    for source in local_image_sources(&draft.content)? {
-        let image_path = draft.resolve_local_image(&source).await?;
-        validate_article_image(&image_path).await?;
-        let key = draft.relative_key(&image_path)?;
-        let hash = file_sha256(&image_path).await?;
-        local_images.push((source, image_path, key, hash));
-    }
+    let assets = prepare_assets(&draft).await?;
 
     let legacy_policy = match legacy_state {
         Some(LegacyStateAction::Adopt) => LegacyStatePolicy::Adopt,
@@ -44,45 +33,48 @@ pub async fn push(
     };
     let (_state_lock, mut state) =
         DraftState::acquire(&draft.root, client.account_id(), legacy_policy).await?;
-    let mut uploaded_assets = 0_u64;
-    let mut reused_assets = 0_u64;
-
-    let cover_key = draft.relative_key(&draft.cover_path)?;
-    let cover_hash = file_sha256(&draft.cover_path).await?;
-    let cover_media_id = if let Some((media_id, _)) = state
-        .permanent_image(&cover_key, &cover_hash)
-        .map(|(media_id, url)| (media_id.to_owned(), url.to_owned()))
-    {
-        reused_assets += 1;
-        media_id
-    } else {
-        let uploaded = client.materials().upload_image(&draft.cover_path).await?;
-        let media_id = uploaded.media_id.to_string();
-        state.record_permanent_image(cover_key, cover_hash, media_id.clone(), uploaded.url);
-        state.save().await?;
-        uploaded_assets += 1;
-        media_id
+    let mut counts = AssetCounts::default();
+    let article = match assets {
+        PreparedAssets::News {
+            content,
+            cover,
+            local_images,
+        } => {
+            let cover_media_id = permanent_media_id(client, &mut state, cover, &mut counts).await?;
+            let mut replacements = HashMap::new();
+            for LocalArticleImage {
+                source,
+                path,
+                key,
+                hash,
+            } in local_images
+            {
+                let url = if let Some(url) = state.article_image(&key, &hash).map(ToOwned::to_owned)
+                {
+                    counts.reused += 1;
+                    url
+                } else {
+                    let uploaded = client.materials().upload_article_image(&path).await?;
+                    let url = uploaded.url;
+                    state.record_article_image(key, hash, url.clone());
+                    state.save().await?;
+                    counts.uploaded += 1;
+                    url
+                };
+                replacements.insert(source, url);
+            }
+            let content = rewrite_local_images(&content, &replacements)?;
+            draft.build_news_article(cover_media_id, content)?
+        }
+        PreparedAssets::Picture { images } => {
+            let mut media_ids = Vec::with_capacity(images.len());
+            for image in images {
+                media_ids.push(permanent_media_id(client, &mut state, image, &mut counts).await?);
+            }
+            draft.build_picture_article(media_ids)?
+        }
     };
-
-    let mut replacements = HashMap::new();
-    for (source, image_path, key, hash) in local_images {
-        let url = if let Some(url) = state.article_image(&key, &hash).map(ToOwned::to_owned) {
-            reused_assets += 1;
-            url
-        } else {
-            let uploaded = client.materials().upload_article_image(&image_path).await?;
-            let url = uploaded.url;
-            state.record_article_image(key, hash, url.clone());
-            state.save().await?;
-            uploaded_assets += 1;
-            url
-        };
-        replacements.insert(source, url);
-    }
-
-    let content = rewrite_local_images(&draft.content, &replacements)?;
-    let article = draft.build_article(cover_media_id, content)?;
-    let request = AddDraftRequest::new(vec![article.into()])?;
+    let request = AddDraftRequest::new(vec![article])?;
     let request_bytes = serde_json::to_vec(&request)?;
     let fingerprint = bytes_sha256(&request_bytes);
 
@@ -90,8 +82,8 @@ pub async fn push(
         return Ok(result_json(
             media_id,
             draft.title(),
-            uploaded_assets,
-            reused_assets,
+            counts.uploaded,
+            counts.reused,
             true,
         ));
     }
@@ -107,8 +99,8 @@ pub async fn push(
             let mut result = result_json(
                 &response.media_id,
                 draft.title(),
-                uploaded_assets,
-                reused_assets,
+                counts.uploaded,
+                counts.reused,
                 false,
             );
             if let Err(error) = state.save().await {
@@ -126,6 +118,109 @@ pub async fn push(
         }
         Err(source) => Err(CliError::AmbiguousDraftPush { source }),
     }
+}
+
+struct PermanentAsset {
+    path: PathBuf,
+    key: String,
+    hash: String,
+}
+
+struct LocalArticleImage {
+    source: String,
+    path: PathBuf,
+    key: String,
+    hash: String,
+}
+
+enum PreparedAssets {
+    News {
+        content: String,
+        cover: PermanentAsset,
+        local_images: Vec<LocalArticleImage>,
+    },
+    Picture {
+        images: Vec<PermanentAsset>,
+    },
+}
+
+#[derive(Default)]
+struct AssetCounts {
+    uploaded: u64,
+    reused: u64,
+}
+
+async fn prepare_assets(draft: &ResolvedDraft) -> Result<PreparedAssets, CliError> {
+    // Resolve, validate, and hash every dependency before uploading anything.
+    // This avoids leaving permanent orphan assets when a later path is bad.
+    match &draft.article {
+        ResolvedArticle::News {
+            content,
+            cover_path,
+            ..
+        } => {
+            let cover = prepare_permanent_asset(draft, cover_path).await?;
+            let mut local_images = Vec::new();
+            for source in local_image_sources(content)? {
+                let path = draft.resolve_local_image(&source).await?;
+                validate_article_image(&path).await?;
+                let key = draft.relative_key(&path)?;
+                let hash = file_sha256(&path).await?;
+                local_images.push(LocalArticleImage {
+                    source,
+                    path,
+                    key,
+                    hash,
+                });
+            }
+            Ok(PreparedAssets::News {
+                content: content.clone(),
+                cover,
+                local_images,
+            })
+        }
+        ResolvedArticle::Picture { image_paths, .. } => {
+            let mut images = Vec::with_capacity(image_paths.len());
+            for path in image_paths {
+                images.push(prepare_permanent_asset(draft, path).await?);
+            }
+            Ok(PreparedAssets::Picture { images })
+        }
+    }
+}
+
+async fn prepare_permanent_asset(
+    draft: &ResolvedDraft,
+    path: &Path,
+) -> Result<PermanentAsset, CliError> {
+    validate_permanent_image(path).await?;
+    Ok(PermanentAsset {
+        path: path.to_path_buf(),
+        key: draft.relative_key(path)?,
+        hash: file_sha256(path).await?,
+    })
+}
+
+async fn permanent_media_id(
+    client: &WechatOAClient,
+    state: &mut DraftState,
+    asset: PermanentAsset,
+    counts: &mut AssetCounts,
+) -> Result<String, CliError> {
+    if let Some((media_id, _)) = state
+        .permanent_image(&asset.key, &asset.hash)
+        .map(|(media_id, url)| (media_id.to_owned(), url.to_owned()))
+    {
+        counts.reused += 1;
+        return Ok(media_id);
+    }
+
+    let uploaded = client.materials().upload_image(&asset.path).await?;
+    let media_id = uploaded.media_id.to_string();
+    state.record_permanent_image(asset.key, asset.hash, media_id.clone(), uploaded.url);
+    state.save().await?;
+    counts.uploaded += 1;
+    Ok(media_id)
 }
 
 pub(super) fn is_unambiguous_failure(error: &WechatError) -> bool {

@@ -81,8 +81,8 @@ chmod 600 /path/to/config.json
 | 命令 | 是否访问微信 | 作用 |
 | --- | --- | --- |
 | `wechat-oa draft schema` | 否 | 输出本地 `draft.json` 的 JSON Schema 和示例 |
-| `wechat-oa draft validate <PATH>` | 否 | 校验 manifest、正文、封面和本地图片，不上传任何内容 |
-| `wechat-oa draft push <PATH>` | 是 | 上传封面为永久素材，上传正文图片并改写 URL，最后创建远端草稿 |
+| `wechat-oa draft validate <PATH>` | 否 | 校验文章或贴图 manifest、正文和本地图片，不上传任何内容 |
+| `wechat-oa draft push <PATH>` | 是 | 自动上传文章封面/正文图片或贴图图片，最后创建远端草稿 |
 | `wechat-oa draft count` | 是 | 获取远端草稿总数 |
 | `wechat-oa draft list` | 是 | 分页列出草稿，默认不返回正文；`--include-content` 可包含正文 |
 | `wechat-oa draft get <MEDIA_ID>` | 是 | 获取指定草稿详情 |
@@ -96,6 +96,37 @@ wechat-oa draft push ./my-draft
 ```
 
 `draft push` 会维护按公众号隔离的本地状态，用于复用已经上传且内容未变化的图片，并避免网络结果不明确时自动重复创建草稿。遇到历史无账号缓存时，确认属于当前账号后使用 `--legacy-state adopt`，或使用 `--legacy-state discard` 删除旧缓存并重新上传。
+
+### 本地草稿格式
+
+普通文章使用 `article_type: "news"`。正文是 HTML；CLI 会上传封面和正文引用的本地图片，并自动改写图片 URL：
+
+```json
+{
+  "schema_version": 1,
+  "article_type": "news",
+  "title": "Article title",
+  "content_file": "content.html",
+  "cover_file": "assets/cover.jpg"
+}
+```
+
+贴图消息使用 `article_type: "newspic"`。`image_files` 接受 1～20 张图片；CLI 会将它们上传为永久素材，再按原顺序创建贴图草稿：
+
+```json
+{
+  "schema_version": 1,
+  "article_type": "newspic",
+  "title": "Picture post title",
+  "content_file": "content.txt",
+  "image_files": [
+    "assets/01.jpg",
+    "assets/02.jpg"
+  ]
+}
+```
+
+所有文件路径必须是相对于 `draft.json` 所在目录的路径，且不能逃逸到目录之外。完整字段和限制以 `wechat-oa draft schema` 的机器可读输出为准。
 
 ## 底层命令
 
