@@ -23,17 +23,50 @@ async fn test_server(body: &'static str) -> (String, Arc<AtomicUsize>) {
             };
             count.fetch_add(1, Ordering::SeqCst);
             let mut buffer = [0_u8; 4096];
-            let _ = stream.read(&mut buffer).await;
+            let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]);
+            let response_body = if request.starts_with("POST /cgi-bin/stable_token ") {
+                body
+            } else {
+                r#"{"errcode":40002,"errmsg":"expected stable token POST"}"#
+            };
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                body.len(),
-                body
+                response_body.len(),
+                response_body
             );
             let _ = stream.write_all(response.as_bytes()).await;
         }
     });
 
-    (format!("http://{address}/cgi-bin/token"), request_count)
+    (
+        format!("http://{address}/cgi-bin/stable_token"),
+        request_count,
+    )
+}
+
+#[test]
+fn stable_token_request_only_sends_force_refresh_when_requested() {
+    let normal = serde_json::to_value(TokenRequest {
+        grant_type: "client_credential",
+        appid: "app-id",
+        secret: "secret",
+        force_refresh: false,
+    })
+    .unwrap();
+    let forced = serde_json::to_value(TokenRequest {
+        grant_type: "client_credential",
+        appid: "app-id",
+        secret: "secret",
+        force_refresh: true,
+    })
+    .unwrap();
+
+    assert_eq!(normal["grant_type"], "client_credential");
+    assert_eq!(normal["appid"], "app-id");
+    assert_eq!(normal["secret"], "secret");
+    assert!(normal.get("force_refresh").is_none());
+    assert_eq!(forced["force_refresh"], true);
 }
 
 #[tokio::test]

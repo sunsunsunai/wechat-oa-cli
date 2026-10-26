@@ -4,7 +4,7 @@ pub use builder::TokenManagerBuilder;
 
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
@@ -12,7 +12,7 @@ use crate::{
     error::{WechatApiError, WechatError},
 };
 
-const TOKEN_ENDPOINT: &str = "https://api.weixin.qq.com/cgi-bin/token";
+const TOKEN_ENDPOINT: &str = "https://api.weixin.qq.com/cgi-bin/stable_token";
 const DEFAULT_REFRESH_BEFORE: Duration = Duration::from_secs(5 * 60);
 const MAX_TOKEN_RESPONSE_LENGTH: usize = 64 * 1024;
 
@@ -46,6 +46,15 @@ struct TokenResponse {
     request_id: Option<String>,
 }
 
+#[derive(Serialize)]
+struct TokenRequest<'a> {
+    grant_type: &'static str,
+    appid: &'a str,
+    secret: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    force_refresh: bool,
+}
+
 impl TokenManager {
     pub fn builder() -> TokenManagerBuilder {
         TokenManagerBuilder::new()
@@ -76,7 +85,7 @@ impl TokenManager {
             return Ok(token);
         }
 
-        let token = self.fetch_token(http).await?;
+        let token = self.fetch_token(http, false).await?;
         let value = token.value.clone();
         *self.cached.write().await = Some(token);
 
@@ -105,16 +114,46 @@ impl TokenManager {
         }
     }
 
-    async fn fetch_token(&self, http: &reqwest::Client) -> Result<CachedToken, WechatError> {
-        let mut url = reqwest::Url::parse(&self.endpoint)
+    /// Replaces a token explicitly rejected by WeChat using stable-token force refresh.
+    pub(crate) async fn refresh_rejected(
+        &self,
+        http: &reqwest::Client,
+        rejected_token: &str,
+    ) -> Result<String, WechatError> {
+        let _refresh_guard = self.refresh_lock.lock().await;
+
+        if let Some(token) = self.cached_token().await
+            && token != rejected_token
+        {
+            return Ok(token);
+        }
+
+        self.invalidate(rejected_token).await;
+        let token = self.fetch_token(http, true).await?;
+        let value = token.value.clone();
+        *self.cached.write().await = Some(token);
+        Ok(value)
+    }
+
+    async fn fetch_token(
+        &self,
+        http: &reqwest::Client,
+        force_refresh: bool,
+    ) -> Result<CachedToken, WechatError> {
+        let url = reqwest::Url::parse(&self.endpoint)
             .map_err(|_| WechatError::InvalidTokenResponse("invalid token endpoint"))?;
-        url.query_pairs_mut()
-            .append_pair("grant_type", "client_credential")
-            .append_pair("appid", &self.app_id)
-            .append_pair("secret", &self.app_secret);
+        let request_body = serde_json::to_vec(&TokenRequest {
+            grant_type: "client_credential",
+            appid: &self.app_id,
+            secret: &self.app_secret,
+            force_refresh,
+        })
+        .map_err(WechatError::Encode)?;
 
         let mut response = http
-            .get(url)
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(request_body)
             .send()
             .await
             .map_err(|source| WechatError::Http {

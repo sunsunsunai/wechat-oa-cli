@@ -114,7 +114,7 @@ impl AddDraftDocument {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "article_type")]
+#[serde(tag = "article_type", deny_unknown_fields)]
 enum AddDraftArticle {
     #[serde(rename = "news")]
     News {
@@ -296,5 +296,21 @@ mod tests {
                 limit: MAX_JSON_INPUT_LENGTH
             })
         ));
+    }
+
+    #[test]
+    fn rejects_unknown_low_level_article_fields() {
+        let error = serde_json::from_value::<AddDraftDocument>(json!({
+            "articles": [{
+                "article_type": "news",
+                "title": "Title",
+                "content": "<p>Body</p>",
+                "thumb_media_id": "thumb-id",
+                "need_open_comments": true
+            }]
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("unknown field"));
     }
 }

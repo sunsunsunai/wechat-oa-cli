@@ -79,7 +79,8 @@ fn error_type(error: &CliError) -> &'static str {
         | CliError::DecodeInput { .. }
         | CliError::InvalidDate { .. }
         | CliError::InvalidDraft(_)
-        | CliError::Html(_) => "invalid_input",
+        | CliError::Html(_)
+        | CliError::InputTooLarge { .. } => "invalid_input",
         CliError::LegacyStatePolicyRequired | CliError::ConflictingLegacyStates => "legacy_state",
         CliError::ReadFile { .. } | CliError::WriteFile { .. } | CliError::LocalState(_) => "io",
         CliError::PendingDraft | CliError::AmbiguousDraftPush { .. } => "ambiguous_operation",
@@ -114,5 +115,13 @@ mod tests {
         assert_eq!(value["error"]["code"], 48_001);
         assert_eq!(value["error"]["request_id"], "request-id");
         assert_eq!(exit_code(&error), 5);
+    }
+
+    #[test]
+    fn classifies_oversized_input_as_invalid_input() {
+        let error = CliError::InputTooLarge { limit: 42 };
+
+        assert_eq!(error_type(&error), "invalid_input");
+        assert_eq!(exit_code(&error), 3);
     }
 }

@@ -95,7 +95,7 @@ wechat-oa draft validate ./my-draft
 wechat-oa draft push ./my-draft
 ```
 
-`draft push` 会维护按公众号隔离的本地状态，用于复用已经上传且内容未变化的图片，并避免网络结果不明确时自动重复创建草稿。遇到历史无账号缓存时，确认属于当前账号后使用 `--legacy-state adopt`，或使用 `--legacy-state discard` 删除旧缓存并重新上传。
+`draft push` 会维护按公众号隔离的本地状态，用于复用已经上传且内容未变化的图片，并避免网络结果不明确时自动重复创建草稿。复用草稿前会向微信确认它仍然存在；如果素材在微信后台被删除，或确实需要重新上传所有图片并创建新草稿，可使用 `--force`。遇到历史无账号缓存时，确认属于当前账号后使用 `--legacy-state adopt`，或使用 `--legacy-state discard` 删除旧缓存并重新上传。
 
 ### 本地草稿格式
 

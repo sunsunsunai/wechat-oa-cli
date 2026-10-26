@@ -22,10 +22,11 @@ use crate::{
 pub async fn push(
     client: &WechatOAClient,
     path: &Path,
+    force: bool,
     retry_ambiguous: bool,
     legacy_state: Option<LegacyStateAction>,
 ) -> Result<Value, CliError> {
-    push_with_backend(client, path, retry_ambiguous, legacy_state).await
+    push_with_backend(client, path, force, retry_ambiguous, legacy_state).await
 }
 
 trait DraftBackend {
@@ -36,6 +37,8 @@ trait DraftBackend {
     async fn upload_article_image(&self, path: &Path) -> Result<ArticleImage, WechatError>;
 
     async fn add_draft(&self, request: &AddDraftRequest) -> Result<AddDraftResponse, WechatError>;
+
+    async fn draft_exists(&self, media_id: &str) -> Result<bool, WechatError>;
 }
 
 impl DraftBackend for WechatOAClient {
@@ -54,11 +57,20 @@ impl DraftBackend for WechatOAClient {
     async fn add_draft(&self, request: &AddDraftRequest) -> Result<AddDraftResponse, WechatError> {
         self.draft().add(request).await
     }
+
+    async fn draft_exists(&self, media_id: &str) -> Result<bool, WechatError> {
+        match self.draft().get(media_id).await {
+            Ok(_) => Ok(true),
+            Err(WechatError::Api(error)) if error.code == 40007 => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 async fn push_with_backend<B: DraftBackend>(
     backend: &B,
     path: &Path,
+    force: bool,
     retry_ambiguous: bool,
     legacy_state: Option<LegacyStateAction>,
 ) -> Result<Value, CliError> {
@@ -84,7 +96,7 @@ async fn push_with_backend<B: DraftBackend>(
             local_images,
         } => {
             let cover_media_id =
-                permanent_media_id(backend, &mut state, cover, &mut counts).await?;
+                permanent_media_id(backend, &mut state, cover, &mut counts, force).await?;
             let mut replacements = HashMap::new();
             for LocalArticleImage {
                 source,
@@ -93,7 +105,8 @@ async fn push_with_backend<B: DraftBackend>(
                 hash,
             } in local_images
             {
-                let url = if let Some(url) = state.article_image(&key, &hash).map(ToOwned::to_owned)
+                let url = if !force
+                    && let Some(url) = state.article_image(&key, &hash).map(ToOwned::to_owned)
                 {
                     counts.reused += 1;
                     url
@@ -113,7 +126,9 @@ async fn push_with_backend<B: DraftBackend>(
         PreparedAssets::Picture { images } => {
             let mut media_ids = Vec::with_capacity(images.len());
             for image in images {
-                media_ids.push(permanent_media_id(backend, &mut state, image, &mut counts).await?);
+                media_ids.push(
+                    permanent_media_id(backend, &mut state, image, &mut counts, force).await?,
+                );
             }
             draft.build_picture_article(media_ids)?
         }
@@ -122,14 +137,22 @@ async fn push_with_backend<B: DraftBackend>(
     let request_bytes = serde_json::to_vec(&request)?;
     let fingerprint = bytes_sha256(&request_bytes);
 
-    if let Some(media_id) = state.completed_media_id(&fingerprint) {
-        return Ok(result_json(
-            media_id,
-            draft.title(),
-            counts.uploaded,
-            counts.reused,
-            true,
-        ));
+    if !force
+        && let Some(media_id) = state
+            .completed_media_id(&fingerprint)
+            .map(ToOwned::to_owned)
+    {
+        if backend.draft_exists(&media_id).await? {
+            return Ok(result_json(
+                &media_id,
+                draft.title(),
+                counts.uploaded,
+                counts.reused,
+                true,
+            ));
+        }
+        state.remove_completed(&fingerprint);
+        state.save().await?;
     }
     state.begin_push(fingerprint.clone());
     state.save().await?;
@@ -246,10 +269,12 @@ async fn permanent_media_id<B: DraftBackend>(
     state: &mut DraftState,
     asset: PermanentAsset,
     counts: &mut AssetCounts,
+    force: bool,
 ) -> Result<String, CliError> {
-    if let Some((media_id, _)) = state
-        .permanent_image(&asset.key, &asset.hash)
-        .map(|(media_id, url)| (media_id.to_owned(), url.to_owned()))
+    if !force
+        && let Some((media_id, _)) = state
+            .permanent_image(&asset.key, &asset.hash)
+            .map(|(media_id, url)| (media_id.to_owned(), url.to_owned()))
     {
         counts.reused += 1;
         return Ok(media_id);
@@ -319,6 +344,7 @@ mod tests {
         permanent_uploads: Mutex<Vec<String>>,
         article_uploads: Mutex<Vec<String>>,
         draft_requests: Mutex<Vec<Value>>,
+        draft_exists: Mutex<bool>,
     }
 
     impl FakeBackend {
@@ -328,6 +354,7 @@ mod tests {
                 permanent_uploads: Mutex::new(Vec::new()),
                 article_uploads: Mutex::new(Vec::new()),
                 draft_requests: Mutex::new(Vec::new()),
+                draft_exists: Mutex::new(true),
             }
         }
     }
@@ -365,6 +392,10 @@ mod tests {
             Ok(AddDraftResponse {
                 media_id: "draft-media-id".to_owned(),
             })
+        }
+
+        async fn draft_exists(&self, _media_id: &str) -> Result<bool, WechatError> {
+            Ok(*self.draft_exists.lock().unwrap())
         }
     }
 
@@ -424,10 +455,10 @@ mod tests {
         let root = temporary_picture_draft("complete");
         let backend = FakeBackend::new(format!("picture-account-{}", std::process::id()));
 
-        let first = push_with_backend(&backend, &root, false, None)
+        let first = push_with_backend(&backend, &root, false, false, None)
             .await
             .unwrap();
-        let second = push_with_backend(&backend, &root, false, None)
+        let second = push_with_backend(&backend, &root, false, false, None)
             .await
             .unwrap();
 
@@ -470,7 +501,7 @@ mod tests {
         state.save().await.unwrap();
         drop(lock);
 
-        let error = push_with_backend(&backend, &root, false, None)
+        let error = push_with_backend(&backend, &root, false, false, None)
             .await
             .unwrap_err();
 
@@ -478,6 +509,45 @@ mod tests {
         assert!(backend.permanent_uploads.lock().unwrap().is_empty());
         assert!(backend.article_uploads.lock().unwrap().is_empty());
         assert!(backend.draft_requests.lock().unwrap().is_empty());
+        clean_test_state(&root, backend.account_id());
+    }
+
+    #[tokio::test]
+    async fn missing_remote_draft_is_recreated() {
+        let root = temporary_picture_draft("missing-remote");
+        let backend = FakeBackend::new(format!("missing-account-{}", std::process::id()));
+
+        push_with_backend(&backend, &root, false, false, None)
+            .await
+            .unwrap();
+        *backend.draft_exists.lock().unwrap() = false;
+        let recreated = push_with_backend(&backend, &root, false, false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(recreated["reused_draft"], false);
+        assert_eq!(recreated["assets"]["reused"], 2);
+        assert_eq!(backend.draft_requests.lock().unwrap().len(), 2);
+        clean_test_state(&root, backend.account_id());
+    }
+
+    #[tokio::test]
+    async fn force_reuploads_assets_and_creates_a_new_draft() {
+        let root = temporary_picture_draft("force");
+        let backend = FakeBackend::new(format!("force-account-{}", std::process::id()));
+
+        push_with_backend(&backend, &root, false, false, None)
+            .await
+            .unwrap();
+        let forced = push_with_backend(&backend, &root, true, false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(forced["reused_draft"], false);
+        assert_eq!(forced["assets"]["uploaded"], 2);
+        assert_eq!(forced["assets"]["reused"], 0);
+        assert_eq!(backend.permanent_uploads.lock().unwrap().len(), 4);
+        assert_eq!(backend.draft_requests.lock().unwrap().len(), 2);
         clean_test_state(&root, backend.account_id());
     }
 }

@@ -38,9 +38,10 @@ pub async fn run(cli: Cli) -> Result<Value, CliError> {
         Command::Draft { command } => match command {
             DraftCommand::Push {
                 path,
+                force,
                 retry_ambiguous,
                 legacy_state,
-            } => draft::push(&client, &path, retry_ambiguous, legacy_state).await,
+            } => draft::push(&client, &path, force, retry_ambiguous, legacy_state).await,
             DraftCommand::Count => draft::count(&client).await,
             DraftCommand::List(args) => {
                 draft::list(&client, args.offset, args.count, args.include_content).await

@@ -174,8 +174,10 @@ impl WechatOAClient {
                 Err(WechatError::Api(ref error))
                     if error.is_token_invalid() && !token_refreshed =>
                 {
-                    self.token_manager.invalidate(&access_token).await;
-                    access_token = self.token_manager.access_token(&self.http_client).await?;
+                    access_token = self
+                        .token_manager
+                        .refresh_rejected(&self.http_client, &access_token)
+                        .await?;
                     token_refreshed = true;
                 }
                 Err(ref error)
@@ -374,7 +376,7 @@ mod tests {
                 let bytes_read = stream.read(&mut buffer).await.unwrap_or(0);
                 let request = String::from_utf8_lossy(&buffer[..bytes_read]);
 
-                let body = if request.starts_with("GET /token") {
+                let body = if request.starts_with("POST /token") {
                     let call = token_count.fetch_add(1, Ordering::SeqCst);
                     let token = match behavior {
                         ApiBehavior::RejectFirstToken if call == 0 => "token-1",

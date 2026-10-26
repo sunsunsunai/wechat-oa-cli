@@ -58,6 +58,9 @@ pub enum DraftCommand {
     /// Upload a local draft bundle and create a remote draft.
     Push {
         path: PathBuf,
+        /// Ignore reusable draft and asset records, upload all assets, and create a new draft.
+        #[arg(long)]
+        force: bool,
         /// Retry when the previous request may have reached WeChat but no response was received.
         #[arg(long)]
         retry_ambiguous: bool,
@@ -194,9 +197,23 @@ mod tests {
             cli.command,
             Command::Draft {
                 command: DraftCommand::Push {
+                    force: false,
                     legacy_state: Some(LegacyStateAction::Adopt),
                     ..
                 }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_force_push() {
+        let cli =
+            Cli::try_parse_from(["wechat-oa", "draft", "push", "article", "--force"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Draft {
+                command: DraftCommand::Push { force: true, .. }
             }
         ));
     }

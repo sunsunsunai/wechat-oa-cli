@@ -254,6 +254,10 @@ impl DraftState {
         self.completed_pushes.get(fingerprint).map(String::as_str)
     }
 
+    pub(crate) fn remove_completed(&mut self, fingerprint: &str) {
+        self.completed_pushes.remove(fingerprint);
+    }
+
     pub(crate) fn has_pending(&self) -> bool {
         self.pending_push.is_some()
     }
