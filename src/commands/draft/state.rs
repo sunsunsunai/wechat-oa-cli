@@ -258,6 +258,21 @@ impl DraftState {
         self.pending_push.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_directories(
+        root: &Path,
+        account_id: &str,
+    ) -> Result<[PathBuf; 2], CliError> {
+        let accountless_namespace =
+            format!("draft-{}", bytes_sha256(root.to_string_lossy().as_bytes()));
+        let identity = format!("{}\0{account_id}", root.to_string_lossy());
+        let account_namespace = format!("draft-{}", bytes_sha256(identity.as_bytes()));
+        Ok([
+            state_directory(&accountless_namespace)?,
+            state_directory(&account_namespace)?,
+        ])
+    }
+
     pub(crate) fn begin_push(&mut self, fingerprint: String) {
         self.pending_push = Some(fingerprint);
     }

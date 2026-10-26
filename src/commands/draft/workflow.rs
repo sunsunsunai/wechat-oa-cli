@@ -11,14 +11,53 @@ use crate::{
     cli::{CliError, LegacyStateAction},
     client::{
         WechatOAClient,
-        draft::AddDraftRequest,
-        material::{validate_article_image, validate_permanent_image},
+        draft::{AddDraftRequest, AddDraftResponse},
+        material::{
+            ArticleImage, PermanentImage, validate_article_image, validate_permanent_image,
+        },
     },
     error::WechatError,
 };
 
 pub async fn push(
     client: &WechatOAClient,
+    path: &Path,
+    retry_ambiguous: bool,
+    legacy_state: Option<LegacyStateAction>,
+) -> Result<Value, CliError> {
+    push_with_backend(client, path, retry_ambiguous, legacy_state).await
+}
+
+trait DraftBackend {
+    fn account_id(&self) -> &str;
+
+    async fn upload_permanent_image(&self, path: &Path) -> Result<PermanentImage, WechatError>;
+
+    async fn upload_article_image(&self, path: &Path) -> Result<ArticleImage, WechatError>;
+
+    async fn add_draft(&self, request: &AddDraftRequest) -> Result<AddDraftResponse, WechatError>;
+}
+
+impl DraftBackend for WechatOAClient {
+    fn account_id(&self) -> &str {
+        WechatOAClient::account_id(self)
+    }
+
+    async fn upload_permanent_image(&self, path: &Path) -> Result<PermanentImage, WechatError> {
+        self.materials().upload_image(path).await
+    }
+
+    async fn upload_article_image(&self, path: &Path) -> Result<ArticleImage, WechatError> {
+        self.materials().upload_article_image(path).await
+    }
+
+    async fn add_draft(&self, request: &AddDraftRequest) -> Result<AddDraftResponse, WechatError> {
+        self.draft().add(request).await
+    }
+}
+
+async fn push_with_backend<B: DraftBackend>(
+    backend: &B,
     path: &Path,
     retry_ambiguous: bool,
     legacy_state: Option<LegacyStateAction>,
@@ -32,7 +71,11 @@ pub async fn push(
         None => LegacyStatePolicy::Reject,
     };
     let (_state_lock, mut state) =
-        DraftState::acquire(&draft.root, client.account_id(), legacy_policy).await?;
+        DraftState::acquire(&draft.root, backend.account_id(), legacy_policy).await?;
+    if state.has_pending() && !retry_ambiguous {
+        return Err(CliError::PendingDraft);
+    }
+
     let mut counts = AssetCounts::default();
     let article = match assets {
         PreparedAssets::News {
@@ -40,7 +83,8 @@ pub async fn push(
             cover,
             local_images,
         } => {
-            let cover_media_id = permanent_media_id(client, &mut state, cover, &mut counts).await?;
+            let cover_media_id =
+                permanent_media_id(backend, &mut state, cover, &mut counts).await?;
             let mut replacements = HashMap::new();
             for LocalArticleImage {
                 source,
@@ -54,7 +98,7 @@ pub async fn push(
                     counts.reused += 1;
                     url
                 } else {
-                    let uploaded = client.materials().upload_article_image(&path).await?;
+                    let uploaded = backend.upload_article_image(&path).await?;
                     let url = uploaded.url;
                     state.record_article_image(key, hash, url.clone());
                     state.save().await?;
@@ -69,7 +113,7 @@ pub async fn push(
         PreparedAssets::Picture { images } => {
             let mut media_ids = Vec::with_capacity(images.len());
             for image in images {
-                media_ids.push(permanent_media_id(client, &mut state, image, &mut counts).await?);
+                media_ids.push(permanent_media_id(backend, &mut state, image, &mut counts).await?);
             }
             draft.build_picture_article(media_ids)?
         }
@@ -87,13 +131,9 @@ pub async fn push(
             true,
         ));
     }
-    if state.has_pending() && !retry_ambiguous {
-        return Err(CliError::PendingDraft);
-    }
-
     state.begin_push(fingerprint.clone());
     state.save().await?;
-    match client.draft().add(&request).await {
+    match backend.add_draft(&request).await {
         Ok(response) => {
             state.complete_push(fingerprint, response.media_id.clone());
             let mut result = result_json(
@@ -201,8 +241,8 @@ async fn prepare_permanent_asset(
     })
 }
 
-async fn permanent_media_id(
-    client: &WechatOAClient,
+async fn permanent_media_id<B: DraftBackend>(
+    backend: &B,
     state: &mut DraftState,
     asset: PermanentAsset,
     counts: &mut AssetCounts,
@@ -215,7 +255,7 @@ async fn permanent_media_id(
         return Ok(media_id);
     }
 
-    let uploaded = client.materials().upload_image(&asset.path).await?;
+    let uploaded = backend.upload_permanent_image(&asset.path).await?;
     let media_id = uploaded.media_id.to_string();
     state.record_permanent_image(asset.key, asset.hash, media_id.clone(), uploaded.url);
     state.save().await?;
@@ -265,7 +305,104 @@ fn result_json(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        sync::Mutex,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
+    use crate::client::material::PermanentMediaId;
+
+    struct FakeBackend {
+        account_id: String,
+        permanent_uploads: Mutex<Vec<String>>,
+        article_uploads: Mutex<Vec<String>>,
+        draft_requests: Mutex<Vec<Value>>,
+    }
+
+    impl FakeBackend {
+        fn new(account_id: String) -> Self {
+            Self {
+                account_id,
+                permanent_uploads: Mutex::new(Vec::new()),
+                article_uploads: Mutex::new(Vec::new()),
+                draft_requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DraftBackend for FakeBackend {
+        fn account_id(&self) -> &str {
+            &self.account_id
+        }
+
+        async fn upload_permanent_image(&self, path: &Path) -> Result<PermanentImage, WechatError> {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            self.permanent_uploads.lock().unwrap().push(name.clone());
+            Ok(PermanentImage {
+                media_id: PermanentMediaId::new(format!("media-{name}"))?,
+                url: format!("https://example.invalid/{name}"),
+            })
+        }
+
+        async fn upload_article_image(&self, path: &Path) -> Result<ArticleImage, WechatError> {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            self.article_uploads.lock().unwrap().push(name.clone());
+            Ok(ArticleImage {
+                url: format!("https://example.invalid/{name}"),
+            })
+        }
+
+        async fn add_draft(
+            &self,
+            request: &AddDraftRequest,
+        ) -> Result<AddDraftResponse, WechatError> {
+            self.draft_requests
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(request).unwrap());
+            Ok(AddDraftResponse {
+                media_id: "draft-media-id".to_owned(),
+            })
+        }
+    }
+
+    fn temporary_picture_draft(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "wechat-oa-workflow-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(root.join("assets")).unwrap();
+        fs::write(
+            root.join("draft.json"),
+            r#"{
+                "schema_version": 1,
+                "article_type": "newspic",
+                "title": "Picture post",
+                "content_file": "content.txt",
+                "image_files": ["assets/01.jpg", "assets/02.png"]
+            }"#,
+        )
+        .unwrap();
+        fs::write(root.join("content.txt"), "Picture caption").unwrap();
+        fs::write(root.join("assets/01.jpg"), [0xff, 0xd8, 0xff, 0xd9]).unwrap();
+        fs::write(root.join("assets/02.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        root
+    }
+
+    fn clean_test_state(root: &Path, account_id: &str) {
+        let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let directories = DraftState::test_directories(&canonical_root, account_id).unwrap();
+        let _ = fs::remove_dir_all(root);
+        for directory in directories {
+            let _ = fs::remove_dir_all(directory);
+        }
+    }
 
     #[test]
     fn oversized_or_undecodable_creation_responses_remain_ambiguous() {
@@ -280,5 +417,67 @@ mod tests {
             source: serde_json::from_slice::<Value>(b"not-json").unwrap_err(),
         };
         assert!(!is_unambiguous_failure(&decode));
+    }
+
+    #[tokio::test]
+    async fn picture_push_uploads_in_order_and_reuses_cached_result() {
+        let root = temporary_picture_draft("complete");
+        let backend = FakeBackend::new(format!("picture-account-{}", std::process::id()));
+
+        let first = push_with_backend(&backend, &root, false, None)
+            .await
+            .unwrap();
+        let second = push_with_backend(&backend, &root, false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(first["media_id"], "draft-media-id");
+        assert_eq!(first["assets"]["uploaded"], 2);
+        assert_eq!(second["reused_draft"], true);
+        assert_eq!(second["assets"]["reused"], 2);
+        assert_eq!(
+            *backend.permanent_uploads.lock().unwrap(),
+            vec!["01.jpg", "02.png"]
+        );
+        assert!(backend.article_uploads.lock().unwrap().is_empty());
+
+        let requests = backend.draft_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["articles"][0]["image_info"]["image_list"],
+            json!([
+                { "image_media_id": "media-01.jpg" },
+                { "image_media_id": "media-02.png" }
+            ])
+        );
+        drop(requests);
+        clean_test_state(&root, backend.account_id());
+    }
+
+    #[tokio::test]
+    async fn pending_push_stops_before_uploading_assets() {
+        let root = temporary_picture_draft("pending");
+        let backend = FakeBackend::new(format!("pending-account-{}", std::process::id()));
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let (lock, mut state) = DraftState::acquire(
+            &canonical_root,
+            backend.account_id(),
+            LegacyStatePolicy::Reject,
+        )
+        .await
+        .unwrap();
+        state.begin_push("previous-request".to_owned());
+        state.save().await.unwrap();
+        drop(lock);
+
+        let error = push_with_backend(&backend, &root, false, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CliError::PendingDraft));
+        assert!(backend.permanent_uploads.lock().unwrap().is_empty());
+        assert!(backend.article_uploads.lock().unwrap().is_empty());
+        assert!(backend.draft_requests.lock().unwrap().is_empty());
+        clean_test_state(&root, backend.account_id());
     }
 }

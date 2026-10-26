@@ -111,7 +111,7 @@ wechat-oa draft push ./my-draft
 }
 ```
 
-贴图消息使用 `article_type: "newspic"`。`image_files` 接受 1～20 张图片；CLI 会将它们上传为永久素材，再按原顺序创建贴图草稿：
+贴图消息使用 `article_type: "newspic"`。`content_file` 必须是 UTF-8 纯文本，`image_files` 接受 1～20 张图片；CLI 会将它们上传为永久素材，再按原顺序创建贴图草稿：
 
 ```json
 {

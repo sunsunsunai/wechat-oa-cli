@@ -1,6 +1,6 @@
 [package]
 name = "wechat-oa-cli"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 description = "A machine-friendly CLI and Rust client for WeChat Official Accounts, designed for AI agents and automation."
