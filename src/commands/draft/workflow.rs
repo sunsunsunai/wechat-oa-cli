@@ -24,9 +24,18 @@ pub async fn push(
     path: &Path,
     force: bool,
     retry_ambiguous: bool,
+    discard_pending: bool,
     legacy_state: Option<LegacyStateAction>,
 ) -> Result<Value, CliError> {
-    push_with_backend(client, path, force, retry_ambiguous, legacy_state).await
+    push_with_backend(
+        client,
+        path,
+        force,
+        retry_ambiguous,
+        discard_pending,
+        legacy_state,
+    )
+    .await
 }
 
 trait DraftBackend {
@@ -72,6 +81,7 @@ async fn push_with_backend<B: DraftBackend>(
     path: &Path,
     force: bool,
     retry_ambiguous: bool,
+    discard_pending: bool,
     legacy_state: Option<LegacyStateAction>,
 ) -> Result<Value, CliError> {
     let draft = ResolvedDraft::load(path).await?;
@@ -84,8 +94,15 @@ async fn push_with_backend<B: DraftBackend>(
     };
     let (_state_lock, mut state) =
         DraftState::acquire(&draft.root, backend.account_id(), legacy_policy).await?;
+    if discard_pending && (state.has_pending() || state.has_pending_asset_upload()) {
+        state.clear_all_pending();
+        state.save().await?;
+    }
     if state.has_pending() && !retry_ambiguous {
         return Err(CliError::PendingDraft);
+    }
+    if state.has_pending_asset_upload() && !retry_ambiguous {
+        return Err(CliError::PendingAssetUpload);
     }
 
     let mut counts = AssetCounts::default();
@@ -105,19 +122,19 @@ async fn push_with_backend<B: DraftBackend>(
                 hash,
             } in local_images
             {
-                let url = if !force
-                    && let Some(url) = state.article_image(&key, &hash).map(ToOwned::to_owned)
-                {
-                    counts.reused += 1;
-                    url
-                } else {
-                    let uploaded = backend.upload_article_image(&path).await?;
-                    let url = uploaded.url;
-                    state.record_article_image(key, hash, url.clone());
-                    state.save().await?;
-                    counts.uploaded += 1;
-                    url
-                };
+                let url = article_image_url(
+                    backend,
+                    &mut state,
+                    LocalArticleImage {
+                        source: source.clone(),
+                        path,
+                        key,
+                        hash,
+                    },
+                    &mut counts,
+                    force,
+                )
+                .await?;
                 replacements.insert(source, url);
             }
             let content = rewrite_local_images(&content, &replacements)?;
@@ -133,9 +150,15 @@ async fn push_with_backend<B: DraftBackend>(
             draft.build_picture_article(media_ids)?
         }
     };
+    if state.has_pending_asset_upload() {
+        return Err(CliError::PendingAssetUploadMismatch);
+    }
     let request = AddDraftRequest::new(vec![article])?;
     let request_bytes = serde_json::to_vec(&request)?;
     let fingerprint = bytes_sha256(&request_bytes);
+    if state.has_pending() && !state.pending_push_matches(&fingerprint) {
+        return Err(CliError::PendingDraftMismatch);
+    }
 
     if !force
         && let Some((media_id, stored_remote_fingerprint)) = state
@@ -322,7 +345,10 @@ async fn permanent_media_id<B: DraftBackend>(
     counts: &mut AssetCounts,
     force: bool,
 ) -> Result<String, CliError> {
+    let retrying_pending =
+        state.pending_asset_upload_matches("permanent_image", &asset.key, &asset.hash);
     if !force
+        && !retrying_pending
         && let Some((media_id, _)) = state
             .permanent_image(&asset.key, &asset.hash)
             .map(|(media_id, url)| (media_id.to_owned(), url.to_owned()))
@@ -330,19 +356,75 @@ async fn permanent_media_id<B: DraftBackend>(
         counts.reused += 1;
         return Ok(media_id);
     }
+    if state.has_pending_asset_upload() && !retrying_pending {
+        return Err(CliError::PendingAssetUploadMismatch);
+    }
 
-    let uploaded = backend.upload_permanent_image(&asset.path).await?;
-    let media_id = uploaded.media_id.to_string();
-    state.record_permanent_image(asset.key, asset.hash, media_id.clone(), uploaded.url);
+    state.begin_asset_upload("permanent_image", asset.key.clone(), asset.hash.clone());
     state.save().await?;
-    counts.uploaded += 1;
-    Ok(media_id)
+    match backend.upload_permanent_image(&asset.path).await {
+        Ok(uploaded) => {
+            let media_id = uploaded.media_id.to_string();
+            state.record_permanent_image(asset.key, asset.hash, media_id.clone(), uploaded.url);
+            state.clear_pending_asset_upload();
+            state.save().await?;
+            counts.uploaded += 1;
+            Ok(media_id)
+        }
+        Err(source) if is_unambiguous_failure(&source) => {
+            state.clear_pending_asset_upload();
+            state.save().await?;
+            Err(source.into())
+        }
+        Err(source) => Err(CliError::AmbiguousAssetUpload { source }),
+    }
 }
 
-pub(super) fn is_unambiguous_failure(error: &WechatError) -> bool {
+async fn article_image_url<B: DraftBackend>(
+    backend: &B,
+    state: &mut DraftState,
+    asset: LocalArticleImage,
+    counts: &mut AssetCounts,
+    force: bool,
+) -> Result<String, CliError> {
+    let retrying_pending =
+        state.pending_asset_upload_matches("article_image", &asset.key, &asset.hash);
+    if !force
+        && !retrying_pending
+        && let Some(url) = state
+            .article_image(&asset.key, &asset.hash)
+            .map(ToOwned::to_owned)
+    {
+        counts.reused += 1;
+        return Ok(url);
+    }
+    if state.has_pending_asset_upload() && !retrying_pending {
+        return Err(CliError::PendingAssetUploadMismatch);
+    }
+
+    state.begin_asset_upload("article_image", asset.key.clone(), asset.hash.clone());
+    state.save().await?;
+    match backend.upload_article_image(&asset.path).await {
+        Ok(uploaded) => {
+            state.record_article_image(asset.key, asset.hash, uploaded.url.clone());
+            state.clear_pending_asset_upload();
+            state.save().await?;
+            counts.uploaded += 1;
+            Ok(uploaded.url)
+        }
+        Err(source) if is_unambiguous_failure(&source) => {
+            state.clear_pending_asset_upload();
+            state.save().await?;
+            Err(source.into())
+        }
+        Err(source) => Err(CliError::AmbiguousAssetUpload { source }),
+    }
+}
+
+pub(crate) fn is_unambiguous_failure(error: &WechatError) -> bool {
     match error {
-        WechatError::Api(_)
-        | WechatError::Encode(_)
+        WechatError::Api(error) => !error.is_retryable(),
+        WechatError::Encode(_)
         | WechatError::InvalidParameter { .. }
         | WechatError::InvalidConfig(_)
         | WechatError::Config(_)
@@ -353,7 +435,7 @@ pub(super) fn is_unambiguous_failure(error: &WechatError) -> bool {
         | WechatError::HttpClientBuild(_)
         | WechatError::InsecureConfigPermissions { .. }
         | WechatError::Io(_) => true,
-        WechatError::HttpStatus { status, .. } => *status < 500,
+        WechatError::HttpStatus { status, .. } => *status < 500 && *status != 408,
         WechatError::Http { .. }
         | WechatError::Decode { .. }
         | WechatError::ResponseTooLarge { .. } => false,
@@ -388,7 +470,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::client::material::PermanentMediaId;
+    use crate::{client::material::PermanentMediaId, error::WechatApiError};
 
     struct FakeBackend {
         account_id: String,
@@ -396,6 +478,8 @@ mod tests {
         article_uploads: Mutex<Vec<String>>,
         draft_requests: Mutex<Vec<Value>>,
         remote_fingerprint: Mutex<Option<String>>,
+        next_permanent_error: Mutex<Option<i64>>,
+        next_draft_error: Mutex<Option<i64>>,
     }
 
     impl FakeBackend {
@@ -406,6 +490,8 @@ mod tests {
                 article_uploads: Mutex::new(Vec::new()),
                 draft_requests: Mutex::new(Vec::new()),
                 remote_fingerprint: Mutex::new(Some("remote-fingerprint".to_owned())),
+                next_permanent_error: Mutex::new(None),
+                next_draft_error: Mutex::new(None),
             }
         }
     }
@@ -418,6 +504,14 @@ mod tests {
         async fn upload_permanent_image(&self, path: &Path) -> Result<PermanentImage, WechatError> {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             self.permanent_uploads.lock().unwrap().push(name.clone());
+            if let Some(code) = self.next_permanent_error.lock().unwrap().take() {
+                return Err(WechatApiError {
+                    code,
+                    message: "injected upload failure".to_owned(),
+                    request_id: None,
+                }
+                .into());
+            }
             Ok(PermanentImage {
                 media_id: PermanentMediaId::new(format!("media-{name}"))?,
                 url: format!("https://example.invalid/{name}"),
@@ -440,6 +534,14 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(serde_json::to_value(request).unwrap());
+            if let Some(code) = self.next_draft_error.lock().unwrap().take() {
+                return Err(WechatApiError {
+                    code,
+                    message: "injected draft failure".to_owned(),
+                    request_id: None,
+                }
+                .into());
+            }
             Ok(AddDraftResponse {
                 media_id: "draft-media-id".to_owned(),
             })
@@ -499,6 +601,27 @@ mod tests {
             source: serde_json::from_slice::<Value>(b"not-json").unwrap_err(),
         };
         assert!(!is_unambiguous_failure(&decode));
+
+        let busy = WechatError::Api(WechatApiError {
+            code: -1,
+            message: "system busy".to_owned(),
+            request_id: None,
+        });
+        assert!(!is_unambiguous_failure(&busy));
+
+        let request_timeout = WechatError::HttpStatus {
+            endpoint: "draft/add".to_owned(),
+            status: 408,
+            body: String::new(),
+        };
+        assert!(!is_unambiguous_failure(&request_timeout));
+
+        let rate_limited = WechatError::HttpStatus {
+            endpoint: "draft/add".to_owned(),
+            status: 429,
+            body: String::new(),
+        };
+        assert!(is_unambiguous_failure(&rate_limited));
     }
 
     #[tokio::test]
@@ -506,10 +629,10 @@ mod tests {
         let root = temporary_picture_draft("complete");
         let backend = FakeBackend::new(format!("picture-account-{}", std::process::id()));
 
-        let first = push_with_backend(&backend, &root, false, false, None)
+        let first = push_with_backend(&backend, &root, false, false, false, None)
             .await
             .unwrap();
-        let second = push_with_backend(&backend, &root, false, false, None)
+        let second = push_with_backend(&backend, &root, false, false, false, None)
             .await
             .unwrap();
 
@@ -552,7 +675,7 @@ mod tests {
         state.save().await.unwrap();
         drop(lock);
 
-        let error = push_with_backend(&backend, &root, false, false, None)
+        let error = push_with_backend(&backend, &root, false, false, false, None)
             .await
             .unwrap_err();
 
@@ -564,15 +687,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ambiguous_asset_upload_requires_explicit_retry() {
+        let root = temporary_picture_draft("ambiguous-asset");
+        let backend = FakeBackend::new(format!("ambiguous-asset-account-{}", std::process::id()));
+        *backend.next_permanent_error.lock().unwrap() = Some(-1);
+
+        let first_error = push_with_backend(&backend, &root, false, false, false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(first_error, CliError::AmbiguousAssetUpload { .. }));
+
+        let blocked_error = push_with_backend(&backend, &root, false, false, false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(blocked_error, CliError::PendingAssetUpload));
+        assert_eq!(backend.permanent_uploads.lock().unwrap().len(), 1);
+
+        let retried = push_with_backend(&backend, &root, false, true, false, None)
+            .await
+            .unwrap();
+        assert_eq!(retried["reused_draft"], false);
+        assert_eq!(backend.permanent_uploads.lock().unwrap().len(), 3);
+        clean_test_state(&root, backend.account_id());
+    }
+
+    #[tokio::test]
+    async fn retryable_api_error_keeps_draft_pending() {
+        let root = temporary_picture_draft("ambiguous-draft-api");
+        let backend = FakeBackend::new(format!("ambiguous-draft-account-{}", std::process::id()));
+        *backend.next_draft_error.lock().unwrap() = Some(-1);
+
+        let first_error = push_with_backend(&backend, &root, false, false, false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(first_error, CliError::AmbiguousDraftPush { .. }));
+
+        let blocked_error = push_with_backend(&backend, &root, false, false, false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(blocked_error, CliError::PendingDraft));
+        assert_eq!(backend.draft_requests.lock().unwrap().len(), 1);
+        clean_test_state(&root, backend.account_id());
+    }
+
+    #[tokio::test]
+    async fn explicit_retry_cannot_replace_a_different_pending_asset() {
+        let root = temporary_picture_draft("mismatched-asset");
+        let backend = FakeBackend::new(format!("mismatched-asset-account-{}", std::process::id()));
+        *backend.next_permanent_error.lock().unwrap() = Some(-1);
+        assert!(
+            push_with_backend(&backend, &root, false, false, false, None)
+                .await
+                .is_err()
+        );
+        fs::write(root.join("assets/01.jpg"), [0xff, 0xd8, 0xff, 0xd9, 0x00]).unwrap();
+
+        let error = push_with_backend(&backend, &root, false, true, false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CliError::PendingAssetUploadMismatch));
+        assert_eq!(backend.permanent_uploads.lock().unwrap().len(), 1);
+        clean_test_state(&root, backend.account_id());
+    }
+
+    #[tokio::test]
+    async fn explicit_retry_cannot_replace_a_different_pending_draft() {
+        let root = temporary_picture_draft("mismatched-draft");
+        let backend = FakeBackend::new(format!("mismatched-draft-account-{}", std::process::id()));
+        *backend.next_draft_error.lock().unwrap() = Some(-1);
+        assert!(
+            push_with_backend(&backend, &root, false, false, false, None)
+                .await
+                .is_err()
+        );
+        fs::write(root.join("content.txt"), "Changed caption").unwrap();
+
+        let error = push_with_backend(&backend, &root, false, true, false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CliError::PendingDraftMismatch));
+        assert_eq!(backend.draft_requests.lock().unwrap().len(), 1);
+        clean_test_state(&root, backend.account_id());
+    }
+
+    #[tokio::test]
+    async fn explicit_discard_allows_recovery_with_changed_draft() {
+        let root = temporary_picture_draft("discard-pending-draft");
+        let backend = FakeBackend::new(format!("discard-account-{}", std::process::id()));
+        *backend.next_draft_error.lock().unwrap() = Some(-1);
+        assert!(
+            push_with_backend(&backend, &root, false, false, false, None)
+                .await
+                .is_err()
+        );
+        fs::write(root.join("content.txt"), "Changed after checking WeChat").unwrap();
+
+        let result = push_with_backend(&backend, &root, false, false, true, None)
+            .await
+            .unwrap();
+
+        assert_eq!(result["reused_draft"], false);
+        assert_eq!(backend.draft_requests.lock().unwrap().len(), 2);
+        clean_test_state(&root, backend.account_id());
+    }
+
+    #[tokio::test]
     async fn missing_remote_draft_is_recreated() {
         let root = temporary_picture_draft("missing-remote");
         let backend = FakeBackend::new(format!("missing-account-{}", std::process::id()));
 
-        push_with_backend(&backend, &root, false, false, None)
+        push_with_backend(&backend, &root, false, false, false, None)
             .await
             .unwrap();
         *backend.remote_fingerprint.lock().unwrap() = None;
-        let recreated = push_with_backend(&backend, &root, false, false, None)
+        let recreated = push_with_backend(&backend, &root, false, false, false, None)
             .await
             .unwrap();
 
@@ -587,11 +815,11 @@ mod tests {
         let root = temporary_picture_draft("modified-remote");
         let backend = FakeBackend::new(format!("modified-account-{}", std::process::id()));
 
-        push_with_backend(&backend, &root, false, false, None)
+        push_with_backend(&backend, &root, false, false, false, None)
             .await
             .unwrap();
         *backend.remote_fingerprint.lock().unwrap() = Some("modified".to_owned());
-        let recreated = push_with_backend(&backend, &root, false, false, None)
+        let recreated = push_with_backend(&backend, &root, false, false, false, None)
             .await
             .unwrap();
 
@@ -605,10 +833,10 @@ mod tests {
         let root = temporary_picture_draft("force");
         let backend = FakeBackend::new(format!("force-account-{}", std::process::id()));
 
-        push_with_backend(&backend, &root, false, false, None)
+        push_with_backend(&backend, &root, false, false, false, None)
             .await
             .unwrap();
-        let forced = push_with_backend(&backend, &root, true, false, None)
+        let forced = push_with_backend(&backend, &root, true, false, false, None)
             .await
             .unwrap();
 

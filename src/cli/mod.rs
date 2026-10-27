@@ -62,8 +62,11 @@ pub enum DraftCommand {
         #[arg(long)]
         force: bool,
         /// Retry when the previous request may have reached WeChat but no response was received.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "discard_pending")]
         retry_ambiguous: bool,
+        /// Forget unresolved local operation state before continuing; may duplicate remote data.
+        #[arg(long, conflicts_with = "retry_ambiguous")]
+        discard_pending: bool,
         /// Decide how to handle draft state created before caches were scoped by account.
         #[arg(long, value_enum)]
         legacy_state: Option<LegacyStateAction>,
@@ -114,9 +117,25 @@ pub enum ApiCommand {
 #[derive(Debug, Subcommand)]
 pub enum ApiMaterialCommand {
     /// Upload one image to the permanent material library.
-    UploadImage { path: PathBuf },
+    UploadImage {
+        path: PathBuf,
+        /// Retry when the previous upload may have reached WeChat but no response was received.
+        #[arg(long, conflicts_with = "discard_pending")]
+        retry_ambiguous: bool,
+        /// Forget unresolved local operation state before continuing; may duplicate remote data.
+        #[arg(long, conflicts_with = "retry_ambiguous")]
+        discard_pending: bool,
+    },
     /// Upload one image for embedding in article HTML.
-    UploadArticleImage { path: PathBuf },
+    UploadArticleImage {
+        path: PathBuf,
+        /// Retry when the previous upload may have reached WeChat but no response was received.
+        #[arg(long, conflicts_with = "discard_pending")]
+        retry_ambiguous: bool,
+        /// Forget unresolved local operation state before continuing; may duplicate remote data.
+        #[arg(long, conflicts_with = "retry_ambiguous")]
+        discard_pending: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -126,8 +145,11 @@ pub enum ApiDraftCommand {
         #[arg(long, value_name = "PATH|-", default_value = "-")]
         input: PathBuf,
         /// Retry when the previous request may have reached WeChat but no response was received.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "discard_pending")]
         retry_ambiguous: bool,
+        /// Forget unresolved local operation state before continuing; may duplicate remote data.
+        #[arg(long, conflicts_with = "retry_ambiguous")]
+        discard_pending: bool,
     },
 }
 
@@ -216,5 +238,57 @@ mod tests {
                 command: DraftCommand::Push { force: true, .. }
             }
         ));
+    }
+
+    #[test]
+    fn parses_explicit_retry_for_material_uploads() {
+        let cli = Cli::try_parse_from([
+            "wechat-oa",
+            "api",
+            "material",
+            "upload-image",
+            "cover.jpg",
+            "--retry-ambiguous",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Command::Api {
+                command: ApiCommand::Material {
+                    command: ApiMaterialCommand::UploadImage {
+                        retry_ambiguous: true,
+                        ..
+                    }
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn ambiguous_retry_and_discard_are_mutually_exclusive() {
+        assert!(
+            Cli::try_parse_from([
+                "wechat-oa",
+                "draft",
+                "push",
+                "article",
+                "--retry-ambiguous",
+                "--discard-pending",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "wechat-oa",
+                "api",
+                "material",
+                "upload-image",
+                "cover.jpg",
+                "--retry-ambiguous",
+                "--discard-pending",
+            ])
+            .is_err()
+        );
     }
 }

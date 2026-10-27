@@ -95,7 +95,7 @@ wechat-oa draft validate ./my-draft
 wechat-oa draft push ./my-draft
 ```
 
-`draft push` 会维护按公众号隔离的本地状态，用于复用已经上传且内容未变化的图片，并避免网络结果不明确时自动重复创建草稿。复用草稿前会向微信确认它仍然存在且内容指纹未变化；如果素材在微信后台被删除，或确实需要重新上传所有图片并创建新草稿，可使用 `--force`。遇到历史无账号缓存时，确认属于当前账号后使用 `--legacy-state adopt`，或使用 `--legacy-state discard` 删除旧缓存并重新上传。
+`draft push` 会维护按公众号隔离的本地状态，用于复用已经上传且内容未变化的图片，并避免网络结果不明确时自动重复上传素材或创建草稿。复用草稿前会向微信确认它仍然存在且内容指纹未变化；如果素材在微信后台被删除，或确实需要重新上传所有图片并创建新草稿，可使用 `--force`。素材上传或草稿创建结果不明确时，应先在微信后台检查：重试完全相同的操作使用 `--retry-ambiguous`；确认不再重试原操作、并接受可能产生重复内容后，使用 `--discard-pending` 清除待确认状态并继续当前命令。这两个选项不能同时使用。遇到历史无账号缓存时，确认属于当前账号后使用 `--legacy-state adopt`，或使用 `--legacy-state discard` 删除旧缓存并重新上传。
 
 ### 本地草稿格式
 
@@ -138,10 +138,33 @@ wechat-oa draft push ./my-draft
 | `wechat-oa api material upload-article-image <PATH>` | 上传正文内图片并返回微信 URL | PNG 或 JPEG/JPG，且满足微信大小限制 |
 | `wechat-oa api draft add --input <PATH>` | 直接调用新增草稿接口 | 已解析的 JSON；图片必须已经替换为微信 URL/`media_id`，也可用 `-` 从 stdin 读取 |
 
+素材上传和新增草稿都是非幂等操作。响应不明确时，CLI 会阻止直接重试。检查微信后台后，使用 `--retry-ambiguous` 重试完全相同的操作；如果要放弃原操作的本地待确认状态并继续当前命令，可使用 `--discard-pending`。两者都可能在微信端产生重复内容，应只在确认并接受该风险后使用。
+
 例如从 stdin 创建草稿：
 
 ```bash
 cat request.json | wechat-oa api draft add --input -
+```
+
+贴图请求可以直接使用微信官方的 `image_info.image_list` 结构；评论字段同时接受官方的 `0`/`1` 和 JSON 布尔值：
+
+```json
+{
+  "articles": [
+    {
+      "article_type": "newspic",
+      "title": "Picture post",
+      "content": "Caption",
+      "image_info": {
+        "image_list": [
+          { "image_media_id": "permanent-media-id" }
+        ]
+      },
+      "need_open_comment": 0,
+      "only_fans_can_comment": 0
+    }
+  ]
+}
 ```
 
 底层命令仍会做字段、长度、图片格式和不确定请求校验，但不会替你扫描 HTML、上传依赖图片或改写正文。

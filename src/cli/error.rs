@@ -62,14 +62,37 @@ pub enum CliError {
     ConflictingLegacyStates,
 
     #[error(
-        "the previous draft request may have reached WeChat; inspect remote drafts, then pass --retry-ambiguous only if creating another draft is acceptable"
+        "the previous draft request may have reached WeChat; inspect remote drafts, then retry the same input with --retry-ambiguous or continue with --discard-pending only if duplicates are acceptable"
     )]
     PendingDraft,
+
+    #[error(
+        "the pending draft request does not match this input; retry the original content, or inspect WeChat and use --discard-pending before creating a different draft"
+    )]
+    PendingDraftMismatch,
+
+    #[error(
+        "the previous asset upload may have reached WeChat; inspect remote materials, then retry the same file with --retry-ambiguous or continue with --discard-pending only if duplicates are acceptable"
+    )]
+    PendingAssetUpload,
+
+    #[error(
+        "the pending asset upload does not match this input; retry the original file, or inspect WeChat and use --discard-pending before starting another upload"
+    )]
+    PendingAssetUploadMismatch,
 
     #[error(
         "draft creation may have reached WeChat but its response was not received: {source}; inspect remote drafts before retrying"
     )]
     AmbiguousDraftPush {
+        #[source]
+        source: WechatError,
+    },
+
+    #[error(
+        "asset upload may have reached WeChat but its response was not received: {source}; inspect remote materials before retrying"
+    )]
+    AmbiguousAssetUpload {
         #[source]
         source: WechatError,
     },

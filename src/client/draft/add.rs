@@ -18,6 +18,9 @@ impl AddDraftRequest {
                 message: "must contain at least one article",
             });
         }
+        for article in &articles {
+            article.validate()?;
+        }
 
         Ok(Self { articles })
     }
@@ -62,6 +65,22 @@ mod tests {
             AddDraftRequest::new(Vec::new()),
             Err(WechatError::InvalidParameter {
                 name: "articles",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_fans_only_comments_when_comments_are_closed() {
+        let article =
+            NewsArticleInput::new("title", "body", PermanentMediaId::new("thumb-id").unwrap())
+                .unwrap()
+                .fans_only_comments(true);
+
+        assert!(matches!(
+            AddDraftRequest::new(vec![article.into()]),
+            Err(WechatError::InvalidParameter {
+                name: "only_fans_can_comment",
                 ..
             })
         ));

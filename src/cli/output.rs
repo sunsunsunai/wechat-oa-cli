@@ -35,7 +35,12 @@ pub fn exit_code(error: &CliError) -> u8 {
         | CliError::Wechat(WechatError::InvalidParameter { .. }) => 3,
         CliError::Wechat(WechatError::Api(error)) if error.is_permission_denied() => 5,
         CliError::Wechat(WechatError::Api(_)) => 4,
-        CliError::PendingDraft | CliError::AmbiguousDraftPush { .. } => 6,
+        CliError::PendingDraft
+        | CliError::PendingDraftMismatch
+        | CliError::PendingAssetUpload
+        | CliError::PendingAssetUploadMismatch
+        | CliError::AmbiguousDraftPush { .. }
+        | CliError::AmbiguousAssetUpload { .. } => 6,
         _ => 1,
     }
 }
@@ -83,7 +88,12 @@ fn error_type(error: &CliError) -> &'static str {
         | CliError::InputTooLarge { .. } => "invalid_input",
         CliError::LegacyStatePolicyRequired | CliError::ConflictingLegacyStates => "legacy_state",
         CliError::ReadFile { .. } | CliError::WriteFile { .. } | CliError::LocalState(_) => "io",
-        CliError::PendingDraft | CliError::AmbiguousDraftPush { .. } => "ambiguous_operation",
+        CliError::PendingDraft
+        | CliError::PendingDraftMismatch
+        | CliError::PendingAssetUpload
+        | CliError::PendingAssetUploadMismatch
+        | CliError::AmbiguousDraftPush { .. }
+        | CliError::AmbiguousAssetUpload { .. } => "ambiguous_operation",
         _ => "internal",
     }
 }

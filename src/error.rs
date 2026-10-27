@@ -128,7 +128,7 @@ impl WechatError {
         match self {
             Self::Api(error) => error.is_retryable(),
             Self::Http { source, .. } => source.is_connect() || source.is_timeout(),
-            Self::HttpStatus { status, .. } => *status == 429 || *status >= 500,
+            Self::HttpStatus { status, .. } => matches!(*status, 408 | 425 | 429) || *status >= 500,
             _ => false,
         }
     }

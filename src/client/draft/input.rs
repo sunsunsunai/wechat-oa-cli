@@ -8,6 +8,7 @@ const MAX_AUTHOR_CHARS: usize = 16;
 const MAX_DIGEST_CHARS: usize = 120;
 const MAX_CONTENT_CHARS: usize = 20_000;
 const MAX_CONTENT_BYTES: usize = 1024 * 1024;
+const MAX_CONTENT_SOURCE_URL_BYTES: usize = 1024;
 const MAX_PICTURE_COUNT: usize = 20;
 
 /// An article accepted by the add and update draft APIs.
@@ -29,6 +30,19 @@ impl From<NewsArticleInput> for DraftArticleInput {
 impl From<PictureArticleInput> for DraftArticleInput {
     fn from(article: PictureArticleInput) -> Self {
         Self::Picture(article)
+    }
+}
+
+impl DraftArticleInput {
+    pub(super) fn validate(&self) -> Result<(), WechatError> {
+        match self {
+            Self::News(article) => {
+                validate_comment_options(article.need_open_comment, article.only_fans_can_comment)
+            }
+            Self::Picture(article) => {
+                validate_comment_options(article.need_open_comment, article.only_fans_can_comment)
+            }
+        }
     }
 }
 
@@ -104,6 +118,12 @@ impl NewsArticleInput {
     pub fn content_source_url(mut self, url: impl Into<String>) -> Result<Self, WechatError> {
         let url = url.into();
         validate_required("content_source_url", &url)?;
+        if url.len() > MAX_CONTENT_SOURCE_URL_BYTES {
+            return Err(WechatError::InvalidParameter {
+                name: "content_source_url",
+                message: "must not exceed 1 KiB",
+            });
+        }
         self.content_source_url = Some(url);
         Ok(self)
     }
@@ -249,6 +269,19 @@ fn validate_required(name: &'static str, value: &str) -> Result<(), WechatError>
     Ok(())
 }
 
+fn validate_comment_options(
+    need_open_comment: u8,
+    only_fans_can_comment: u8,
+) -> Result<(), WechatError> {
+    if only_fans_can_comment == 1 && need_open_comment == 0 {
+        return Err(WechatError::InvalidParameter {
+            name: "only_fans_can_comment",
+            message: "requires need_open_comment to be enabled",
+        });
+    }
+    Ok(())
+}
+
 fn validate_max_chars(
     name: &'static str,
     value: &str,
@@ -324,5 +357,11 @@ mod tests {
         assert!(NewsArticleInput::new("title", "", media_id("thumb")).is_err());
         assert!(PictureArticleInput::new("title", "body", Vec::<PermanentMediaId>::new()).is_err());
         assert!(PictureArticleInput::new("title", "body", vec![media_id("image"); 21]).is_err());
+        assert!(
+            NewsArticleInput::new("title", "body", media_id("thumb"))
+                .unwrap()
+                .content_source_url("x".repeat(MAX_CONTENT_SOURCE_URL_BYTES + 1))
+                .is_err()
+        );
     }
 }

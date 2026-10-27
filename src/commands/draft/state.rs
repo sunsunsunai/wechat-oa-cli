@@ -13,7 +13,8 @@ use tokio::io::AsyncReadExt;
 
 use crate::cli::CliError;
 
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
+const MIN_SUPPORTED_STATE_VERSION: u32 = 1;
 const STATE_DIRECTORY: &str = "wechat-oa-cli/drafts";
 const MAX_STATE_FILE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -35,6 +36,8 @@ pub(crate) struct DraftState {
     assets: BTreeMap<String, AssetCache>,
     #[serde(default)]
     pending_push: Option<String>,
+    #[serde(default)]
+    pending_asset_upload: Option<PendingAssetUpload>,
     #[serde(default)]
     completed_pushes: BTreeMap<String, CompletedPushRecord>,
     #[serde(skip)]
@@ -60,6 +63,13 @@ struct PermanentImageRecord {
 struct ArticleImageRecord {
     sha256: String,
     url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingAssetUpload {
+    kind: String,
+    key: String,
+    sha256: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,13 +162,16 @@ impl DraftState {
                         source_name: path.display().to_string(),
                         source,
                     })?;
-                if state.version != STATE_VERSION {
+                if !(MIN_SUPPORTED_STATE_VERSION..=STATE_VERSION).contains(&state.version) {
                     return Err(CliError::InvalidDraft(format!(
-                        "unsupported state version {} in {}",
+                        "unsupported state version {} in {}; supported versions are {} through {}",
                         state.version,
-                        path.display()
+                        path.display(),
+                        MIN_SUPPORTED_STATE_VERSION,
+                        STATE_VERSION,
                     )));
                 }
+                state.version = STATE_VERSION;
                 state.path = path;
                 Ok(state)
             }
@@ -166,6 +179,7 @@ impl DraftState {
                 version: STATE_VERSION,
                 assets: BTreeMap::new(),
                 pending_push: None,
+                pending_asset_upload: None,
                 completed_pushes: BTreeMap::new(),
                 path,
             }),
@@ -292,6 +306,22 @@ impl DraftState {
         self.pending_push.is_some()
     }
 
+    pub(crate) fn pending_push_matches(&self, fingerprint: &str) -> bool {
+        self.pending_push
+            .as_deref()
+            .is_some_and(|pending| pending == fingerprint)
+    }
+
+    pub(crate) fn has_pending_asset_upload(&self) -> bool {
+        self.pending_asset_upload.is_some()
+    }
+
+    pub(crate) fn pending_asset_upload_matches(&self, kind: &str, key: &str, sha256: &str) -> bool {
+        self.pending_asset_upload.as_ref().is_some_and(|pending| {
+            pending.kind == kind && pending.key == key && pending.sha256 == sha256
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn test_directories(
         root: &Path,
@@ -313,6 +343,23 @@ impl DraftState {
 
     pub(crate) fn clear_pending(&mut self) {
         self.pending_push = None;
+    }
+
+    pub(crate) fn begin_asset_upload(&mut self, kind: &'static str, key: String, sha256: String) {
+        self.pending_asset_upload = Some(PendingAssetUpload {
+            kind: kind.to_owned(),
+            key,
+            sha256,
+        });
+    }
+
+    pub(crate) fn clear_pending_asset_upload(&mut self) {
+        self.pending_asset_upload = None;
+    }
+
+    pub(crate) fn clear_all_pending(&mut self) {
+        self.pending_push = None;
+        self.pending_asset_upload = None;
     }
 
     pub(crate) fn complete_push(
@@ -711,6 +758,7 @@ mod tests {
             version: STATE_VERSION,
             assets: BTreeMap::new(),
             pending_push: None,
+            pending_asset_upload: None,
             completed_pushes: BTreeMap::new(),
             path: PathBuf::from("state.json"),
         }
@@ -770,6 +818,22 @@ mod tests {
             state.completed_push("fingerprint"),
             Some(("media-id", None))
         );
+    }
+
+    #[tokio::test]
+    async fn upgrades_version_one_state_in_memory() {
+        let directory = temporary_root("state-v1-upgrade");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.json");
+        fs::write(
+            &path,
+            br#"{"version":1,"assets":{},"pending_push":null,"completed_pushes":{}}"#,
+        )
+        .unwrap();
+
+        let state = DraftState::load_path(path).await.unwrap();
+        assert_eq!(state.version, STATE_VERSION);
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -905,6 +969,7 @@ mod tests {
             version: STATE_VERSION,
             assets: BTreeMap::new(),
             pending_push: Some("pending".to_owned()),
+            pending_asset_upload: None,
             completed_pushes: BTreeMap::new(),
             path: target.clone(),
         };

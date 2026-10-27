@@ -12,18 +12,41 @@ use crate::cli::CliError;
 pub(crate) fn local_image_sources(html: &str) -> Result<Vec<String>, CliError> {
     let sources = Rc::new(RefCell::new(Vec::new()));
     let style_text = Rc::new(RefCell::new(String::new()));
-    let src_sources = Rc::clone(&sources);
+    let image_sources = Rc::clone(&sources);
+    let poster_sources = Rc::clone(&sources);
+    let svg_sources = Rc::clone(&sources);
+    let input_sources = Rc::clone(&sources);
     let srcset_sources = Rc::clone(&sources);
     let style_sources = Rc::clone(&sources);
     let style_text_handler = Rc::clone(&style_text);
     rewrite_str(
         html,
         RewriteStrSettings::new()
-            .append_element_content_handler(element!("img[src], video[poster]", move |element| {
-                for attribute in ["src", "poster"] {
+            .append_element_content_handler(element!("img", move |element| {
+                for attribute in ["src", "data-src", "data-original"] {
                     if let Some(source) = element.get_attribute(attribute) {
-                        src_sources.borrow_mut().push(source);
+                        image_sources.borrow_mut().push(source);
                     }
+                }
+                Ok(())
+            }))
+            .append_element_content_handler(element!("video[poster]", move |element| {
+                if let Some(source) = element.get_attribute("poster") {
+                    poster_sources.borrow_mut().push(source);
+                }
+                Ok(())
+            }))
+            .append_element_content_handler(element!("image", move |element| {
+                for attribute in ["href", "xlink:href"] {
+                    if let Some(source) = element.get_attribute(attribute) {
+                        svg_sources.borrow_mut().push(source);
+                    }
+                }
+                Ok(())
+            }))
+            .append_element_content_handler(element!("input[type=image][src]", move |element| {
+                if let Some(source) = element.get_attribute("src") {
+                    input_sources.borrow_mut().push(source);
                 }
                 Ok(())
             }))
@@ -70,21 +93,56 @@ pub(crate) fn rewrite_local_images(
     replacements: &HashMap<String, String>,
 ) -> Result<String, CliError> {
     let replacements = Rc::new(replacements.clone());
-    let attribute_replacements = Rc::clone(&replacements);
+    let image_replacements = Rc::clone(&replacements);
+    let poster_replacements = Rc::clone(&replacements);
+    let svg_replacements = Rc::clone(&replacements);
+    let input_replacements = Rc::clone(&replacements);
     let srcset_replacements = Rc::clone(&replacements);
     let style_replacements = Rc::clone(&replacements);
     rewrite_str(
         html,
         RewriteStrSettings::new()
-            .append_element_content_handler(element!("img[src], video[poster]", move |element| {
-                for attribute in ["src", "poster"] {
+            .append_element_content_handler(element!("img", move |element| {
+                for attribute in ["src", "data-src", "data-original"] {
                     if let Some(source) = element.get_attribute(attribute)
-                        && let Some(replacement) = attribute_replacements.get(source.trim())
+                        && let Some(replacement) = image_replacements.get(source.trim())
                     {
                         element
                             .set_attribute(attribute, replacement)
                             .expect("attribute names are valid static HTML attribute names");
                     }
+                }
+                Ok(())
+            }))
+            .append_element_content_handler(element!("video[poster]", move |element| {
+                if let Some(source) = element.get_attribute("poster")
+                    && let Some(replacement) = poster_replacements.get(source.trim())
+                {
+                    element
+                        .set_attribute("poster", replacement)
+                        .expect("poster is a valid static HTML attribute name");
+                }
+                Ok(())
+            }))
+            .append_element_content_handler(element!("image", move |element| {
+                for attribute in ["href", "xlink:href"] {
+                    if let Some(source) = element.get_attribute(attribute)
+                        && let Some(replacement) = svg_replacements.get(source.trim())
+                    {
+                        element
+                            .set_attribute(attribute, replacement)
+                            .expect("SVG image attribute names are valid static names");
+                    }
+                }
+                Ok(())
+            }))
+            .append_element_content_handler(element!("input[type=image][src]", move |element| {
+                if let Some(source) = element.get_attribute("src")
+                    && let Some(replacement) = input_replacements.get(source.trim())
+                {
+                    element
+                        .set_attribute("src", replacement)
+                        .expect("src is a valid static HTML attribute name");
                 }
                 Ok(())
             }))
@@ -228,7 +286,7 @@ fn classify_source(source: &str) -> Result<String, CliError> {
     let source = source.trim();
     if source.is_empty() {
         return Err(CliError::InvalidDraft(
-            "an <img> element has an empty src attribute".to_owned(),
+            "an image source attribute cannot be empty".to_owned(),
         ));
     }
     let lower = source.to_ascii_lowercase();
@@ -324,6 +382,47 @@ mod tests {
     }
 
     #[test]
+    fn extracts_and_rewrites_lazy_svg_and_input_images() {
+        let html = r#"<img data-src="assets/lazy.png"><img data-original="assets/original.jpg"><svg><image href="assets/vector.png"></image><image xlink:href="assets/xlink.png"></image></svg><input type="image" src="assets/button.png">"#;
+        assert_eq!(
+            local_image_sources(html).unwrap(),
+            vec![
+                "assets/button.png",
+                "assets/lazy.png",
+                "assets/original.jpg",
+                "assets/vector.png",
+                "assets/xlink.png"
+            ]
+        );
+        let replacements = HashMap::from([
+            (
+                "assets/lazy.png".to_owned(),
+                "https://cdn/lazy.png".to_owned(),
+            ),
+            (
+                "assets/original.jpg".to_owned(),
+                "https://cdn/original.jpg".to_owned(),
+            ),
+            (
+                "assets/vector.png".to_owned(),
+                "https://cdn/vector.png".to_owned(),
+            ),
+            (
+                "assets/button.png".to_owned(),
+                "https://cdn/button.png".to_owned(),
+            ),
+            (
+                "assets/xlink.png".to_owned(),
+                "https://cdn/xlink.png".to_owned(),
+            ),
+        ]);
+        let rewritten = rewrite_local_images(html, &replacements).unwrap();
+        for url in replacements.values() {
+            assert!(rewritten.contains(url), "{url}");
+        }
+    }
+
+    #[test]
     fn rejects_local_urls_in_style_blocks_instead_of_publishing_broken_html() {
         let error = local_image_sources("<style>.hero { background: url(assets/a.png) }</style>")
             .unwrap_err();
@@ -349,6 +448,8 @@ mod tests {
             r#"<source srcset="//example.com/a.png 1x">"#,
             r#"<p style="background:url('http://example.com/a.png')"></p>"#,
             r#"<style>.hero { background:url(https://example.com/a.png) }</style>"#,
+            r#"<img data-src="https://example.com/a.png">"#,
+            r#"<svg><image href="https://example.com/a.png"></image></svg>"#,
         ] {
             let error = local_image_sources(html).unwrap_err();
             assert!(error.to_string().contains("remote image URL"));

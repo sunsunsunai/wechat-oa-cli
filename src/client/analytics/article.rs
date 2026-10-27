@@ -15,15 +15,53 @@ impl AnalyticsApi<'_> {
         request: GetArticleReadRequest,
     ) -> Result<GetArticleReadResponse, WechatError> {
         if request.begin_date != request.end_date {
-            return Err(WechatError::InvalidConfig(
-                "article read only supports a one-day range",
-            ));
+            return Err(WechatError::InvalidParameter {
+                name: "date_range",
+                message: "article read only supports a one-day range",
+            });
+        }
+        if !is_valid_date(&request.begin_date) {
+            return Err(WechatError::InvalidParameter {
+                name: "begin_date",
+                message: "must be a valid date in YYYY-MM-DD format",
+            });
         }
 
         self.client
             .post_idempotent(ARTICLE_READ_ENDPOINT, &request)
             .await
     }
+}
+
+fn is_valid_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return false;
+    }
+    if ![0, 1, 2, 3, 5, 6, 8, 9]
+        .into_iter()
+        .all(|index| bytes[index].is_ascii_digit())
+    {
+        return false;
+    }
+    let year = u32::from(bytes[0] - b'0') * 1_000
+        + u32::from(bytes[1] - b'0') * 100
+        + u32::from(bytes[2] - b'0') * 10
+        + u32::from(bytes[3] - b'0');
+    let month = u32::from(bytes[5] - b'0') * 10 + u32::from(bytes[6] - b'0');
+    let day = u32::from(bytes[8] - b'0') * 10 + u32::from(bytes[9] - b'0');
+    if year == 0 || !(1..=12).contains(&month) {
+        return false;
+    }
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=days_in_month).contains(&day)
 }
 
 /// Request for the `getarticleread` API.
@@ -138,5 +176,21 @@ mod tests {
             serde_json::from_str(r#"{"list":[],"is_delay":false}"#).unwrap();
 
         assert!(!response.is_delay);
+    }
+
+    #[test]
+    fn validates_calendar_dates() {
+        for date in ["2024-02-29", "2025-12-31"] {
+            assert!(is_valid_date(date), "{date}");
+        }
+        for date in [
+            "2025-02-29",
+            "2025-13-01",
+            "2025-01-00",
+            "2025-1-1",
+            "一-01-01",
+        ] {
+            assert!(!is_valid_date(date), "{date}");
+        }
     }
 }

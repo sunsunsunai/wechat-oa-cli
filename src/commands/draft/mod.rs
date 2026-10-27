@@ -1,11 +1,11 @@
 mod document;
 mod html;
-mod state;
-mod workflow;
+pub(crate) mod state;
+pub(crate) mod workflow;
 
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 use serde_json::{Value, json};
 use tokio::io::{self, AsyncReadExt};
 
@@ -57,6 +57,7 @@ pub async fn add_from_input(
     client: &WechatOAClient,
     input: &Path,
     retry_ambiguous: bool,
+    discard_pending: bool,
 ) -> Result<Value, CliError> {
     let (source_name, bytes) = read_json_input(input).await?;
     let document: AddDraftDocument =
@@ -69,8 +70,16 @@ pub async fn add_from_input(
     let (_state_lock, mut state) =
         DraftState::acquire_operation("api-draft-add", client.account_id()).await?;
 
+    if discard_pending && (state.has_pending() || state.has_pending_asset_upload()) {
+        state.clear_all_pending();
+        state.save().await?;
+    }
+
     if state.has_pending() && !retry_ambiguous {
         return Err(CliError::PendingDraft);
+    }
+    if state.has_pending() && !state.pending_push_matches(&fingerprint) {
+        return Err(CliError::PendingDraftMismatch);
     }
 
     state.begin_push(fingerprint.clone());
@@ -127,9 +136,9 @@ enum AddDraftArticle {
         digest: Option<String>,
         #[serde(default)]
         content_source_url: Option<String>,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_bool_or_zero_one")]
         need_open_comment: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_bool_or_zero_one")]
         only_fans_can_comment: bool,
         #[serde(default)]
         cover_info: Option<CoverInfo>,
@@ -140,16 +149,50 @@ enum AddDraftArticle {
     Picture {
         title: String,
         content: String,
-        image_media_ids: Vec<String>,
         #[serde(default)]
+        image_media_ids: Option<Vec<String>>,
+        #[serde(default)]
+        image_info: Option<PictureImageInfoDocument>,
+        #[serde(default, deserialize_with = "deserialize_bool_or_zero_one")]
         need_open_comment: bool,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_bool_or_zero_one")]
         only_fans_can_comment: bool,
         #[serde(default)]
         cover_info: Option<CoverInfo>,
         #[serde(default)]
         product_info: Option<ProductInfo>,
     },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PictureImageInfoDocument {
+    image_list: Vec<PictureImageDocument>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PictureImageDocument {
+    image_media_id: String,
+}
+
+fn deserialize_bool_or_zero_one<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum BoolOrInteger {
+        Bool(bool),
+        Integer(u8),
+    }
+
+    match BoolOrInteger::deserialize(deserializer)? {
+        BoolOrInteger::Bool(value) => Ok(value),
+        BoolOrInteger::Integer(0) => Ok(false),
+        BoolOrInteger::Integer(1) => Ok(true),
+        BoolOrInteger::Integer(_) => Err(de::Error::custom("expected boolean, 0, or 1")),
+    }
 }
 
 impl AddDraftArticle {
@@ -192,11 +235,31 @@ impl AddDraftArticle {
                 title,
                 content,
                 image_media_ids,
+                image_info,
                 need_open_comment,
                 only_fans_can_comment,
                 cover_info,
                 product_info,
             } => {
+                let image_media_ids = match (image_media_ids, image_info) {
+                    (Some(ids), None) => ids,
+                    (None, Some(info)) => info
+                        .image_list
+                        .into_iter()
+                        .map(|image| image.image_media_id)
+                        .collect(),
+                    (Some(_), Some(_)) => {
+                        return Err(CliError::InvalidDraft(
+                            "newspic must contain either image_media_ids or image_info, not both"
+                                .to_owned(),
+                        ));
+                    }
+                    (None, None) => {
+                        return Err(CliError::InvalidDraft(
+                            "newspic requires image_info.image_list or image_media_ids".to_owned(),
+                        ));
+                    }
+                };
                 let image_media_ids = image_media_ids
                     .into_iter()
                     .map(PermanentMediaId::new)
@@ -286,6 +349,53 @@ mod tests {
         .unwrap();
 
         assert!(document.into_request().is_ok());
+    }
+
+    #[test]
+    fn accepts_the_official_newspic_request_shape() {
+        let document: AddDraftDocument = serde_json::from_value(json!({
+            "articles": [{
+                "article_type": "newspic",
+                "title": "Picture post",
+                "content": "Caption",
+                "image_info": {
+                    "image_list": [
+                        { "image_media_id": "image-1" },
+                        { "image_media_id": "image-2" }
+                    ]
+                },
+                "need_open_comment": 1,
+                "only_fans_can_comment": 1
+            }]
+        }))
+        .unwrap();
+
+        let request = document.into_request().unwrap();
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(
+            value["articles"][0]["image_info"]["image_list"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(value["articles"][0]["need_open_comment"], 1);
+    }
+
+    #[test]
+    fn rejects_conflicting_newspic_image_fields() {
+        let document: AddDraftDocument = serde_json::from_value(json!({
+            "articles": [{
+                "article_type": "newspic",
+                "title": "Picture post",
+                "content": "Caption",
+                "image_media_ids": ["image-1"],
+                "image_info": { "image_list": [{ "image_media_id": "image-2" }] }
+            }]
+        }))
+        .unwrap();
+
+        assert!(document.into_request().is_err());
     }
 
     #[test]

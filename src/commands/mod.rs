@@ -40,8 +40,19 @@ pub async fn run(cli: Cli) -> Result<Value, CliError> {
                 path,
                 force,
                 retry_ambiguous,
+                discard_pending,
                 legacy_state,
-            } => draft::push(&client, &path, force, retry_ambiguous, legacy_state).await,
+            } => {
+                draft::push(
+                    &client,
+                    &path,
+                    force,
+                    retry_ambiguous,
+                    discard_pending,
+                    legacy_state,
+                )
+                .await
+            }
             DraftCommand::Count => draft::count(&client).await,
             DraftCommand::List(args) => {
                 draft::list(&client, args.offset, args.count, args.include_content).await
@@ -51,11 +62,18 @@ pub async fn run(cli: Cli) -> Result<Value, CliError> {
         },
         Command::Api { command } => match command {
             ApiCommand::Material { command } => match command {
-                ApiMaterialCommand::UploadImage { path } => {
-                    media::upload_image(&client, &path).await
-                }
-                ApiMaterialCommand::UploadArticleImage { path } => {
-                    media::upload_article_image(&client, &path).await
+                ApiMaterialCommand::UploadImage {
+                    path,
+                    retry_ambiguous,
+                    discard_pending,
+                } => media::upload_image(&client, &path, retry_ambiguous, discard_pending).await,
+                ApiMaterialCommand::UploadArticleImage {
+                    path,
+                    retry_ambiguous,
+                    discard_pending,
+                } => {
+                    media::upload_article_image(&client, &path, retry_ambiguous, discard_pending)
+                        .await
                 }
             },
             ApiCommand::Draft {
@@ -63,8 +81,9 @@ pub async fn run(cli: Cli) -> Result<Value, CliError> {
                     ApiDraftCommand::Add {
                         input,
                         retry_ambiguous,
+                        discard_pending,
                     },
-            } => draft::add_from_input(&client, &input, retry_ambiguous).await,
+            } => draft::add_from_input(&client, &input, retry_ambiguous, discard_pending).await,
         },
     }
 }
